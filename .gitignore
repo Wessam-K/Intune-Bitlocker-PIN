@@ -1,0 +1,38 @@
+# WK-Hub BitLocker PIN
+
+# ── Packaging output ────────────────────────────────────────────────────────
+# The .intunewin is a build artefact — rebuild it from Source\ rather than
+# committing it, so what you upload always matches the scripts in this repo.
+Output/
+*.intunewin
+
+# ── Microsoft tools you supply yourself ─────────────────────────────────────
+# Neither is redistributed with this product. Download them from Microsoft:
+#   IntuneWinAppUtil.exe — Win32 Content Prep Tool
+#   ServiceUI.exe        — Microsoft Deployment Toolkit
+# Ignored here so a local copy is never committed by accident.
+IntuneWinAppUtil.exe
+ServiceUI.exe
+
+# ── Runtime / test output ───────────────────────────────────────────────────
+# Install, uninstall and prompt logs can name devices and users.
+*.log
+prompt.log
+_testrun/
+_sandbox/
+
+# ── Optional branding you drop in ───────────────────────────────────────────
+# The PIN dialog degrades to a text wordmark when these are absent, so your own
+# artwork stays yours and is not committed by mistake. Delete these two lines if
+# you would rather track your branding in your fork.
+brand-*.png
+*-logo-*.png
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
