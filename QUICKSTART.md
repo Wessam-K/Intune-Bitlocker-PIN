@@ -118,8 +118,9 @@ solid colour — deliberate-looking, not broken. To use your own artwork, see
 
 ## Step 5 — Build the `.intunewin`
 
-The packager reads `Source\`, **not** the repo root. An edited script you forgot
-to copy across ships the old version — so always do both commands together.
+`Source\` starts empty — it is a staging folder, not a second copy of the repo.
+The packager reads it rather than the repo root, so an edited script you forgot
+to copy across ships the old version. Always run both commands together.
 
 ```powershell
 Copy-Item .\Install-BitLockerStartupPin.ps1,.\Uninstall-BitLockerStartupPin.ps1,`

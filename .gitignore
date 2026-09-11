@@ -6,6 +6,14 @@
 Output/
 *.intunewin
 
+# Source\ is the staging folder the content-prep tool reads. It is FILLED by the
+# Copy-Item step in QUICKSTART.md step 5, from the scripts in the repo root.
+# Tracking copies of those scripts would mean two versions of every file, and a
+# stale package the day someone edits one and forgets the other - so only the
+# empty folder is kept.
+Source/*
+!Source/.gitkeep
+
 # ── Microsoft tools you supply yourself ─────────────────────────────────────
 # Neither is redistributed with this product. Download them from Microsoft:
 #   IntuneWinAppUtil.exe — Win32 Content Prep Tool
