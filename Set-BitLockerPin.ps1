@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 
 $root     = $PSScriptRoot
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
-$taskName = 'WK-Hub BitLocker PIN Enrollment'
+$taskName = "$Organization BitLocker PIN Enrollment"
 $sysDrive = $env:SystemDrive
 $script:LogFile = Join-Path $root 'prompt.log'
 

@@ -55,6 +55,7 @@ if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') {
 
 $sysDrive = $env:SystemDrive
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
+$taskName = "$Organization BitLocker PIN Enrollment"
 $logName  = 'Microsoft-Windows-BitLocker/BitLocker Management'
 
 function Get-ProtectorNames {
@@ -82,7 +83,7 @@ $props    = Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue
 $appVer   = if ($props.Version) { $props.Version } else { 'not-installed' }
 $pinSetOn = if ($props.PinSetOn) { $props.PinSetOn } elseif ($props.PinAssignedOn) { $props.PinAssignedOn } else { 'never' }
 
-$task      = Get-ScheduledTask -TaskName 'WK-Hub BitLocker PIN Enrollment' -ErrorAction SilentlyContinue
+$task      = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 $taskState = if ($task) { [string]$task.State } else { 'missing' }
 
 # Escrow evidence. Event 845 = the service stored the key. The three-state logic

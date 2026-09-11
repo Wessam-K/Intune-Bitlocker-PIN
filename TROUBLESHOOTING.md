@@ -338,7 +338,7 @@ Run these from the repo folder:
 Both preview modes work with or without brand images present — without them the rail
 draws the organization name as a wordmark on a solid colour.
 
-Self-test suite (89 cases, touches no BitLocker state):
+Self-test suite (92 cases, touches no BitLocker state):
 
 ```powershell
 .\Test-BitLockerPinApp.ps1

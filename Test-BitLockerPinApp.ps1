@@ -68,28 +68,28 @@ function Assert-Throws {
 
 Write-Host "`n=== PIN derivation ===" -ForegroundColor Cyan
 
-Test-Case 'WKH-0051 -> 1110051 (the documented example)' {
-    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'WKH-0051').Pin
+Test-Case 'DEV-0051 -> 1110051 (the documented example)' {
+    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'DEV-0051').Pin
 }
-Test-Case 'WKH-00051 -> 1110051 (this machine; the extra leading zero is the same device number)' {
-    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'WKH-00051').Pin
+Test-Case 'DEV-00051 -> 1110051 (this machine; the extra leading zero is the same device number)' {
+    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'DEV-00051').Pin
 }
-Test-Case 'WKH-10051 -> 11110051 (a wider number is not truncated into a collision)' {
-    Assert-Equal '11110051' (Get-DerivedStartupPin -ComputerName 'WKH-10051').Pin
+Test-Case 'DEV-10051 -> 11110051 (a wider number is not truncated into a collision)' {
+    Assert-Equal '11110051' (Get-DerivedStartupPin -ComputerName 'DEV-10051').Pin
 }
 Test-Case '00051 and 10051 do not collide' {
-    $a = (Get-DerivedStartupPin -ComputerName 'WKH-00051').Pin
-    $b = (Get-DerivedStartupPin -ComputerName 'WKH-10051').Pin
+    $a = (Get-DerivedStartupPin -ComputerName 'DEV-00051').Pin
+    $b = (Get-DerivedStartupPin -ComputerName 'DEV-10051').Pin
     if ($a -eq $b) { throw "both derived to '$a'" }
 }
-Test-Case 'WKH-1 -> 1110001 (short numbers are zero-padded)' {
-    Assert-Equal '1110001' (Get-DerivedStartupPin -ComputerName 'WKH-1').Pin
+Test-Case 'DEV-1 -> 1110001 (short numbers are zero-padded)' {
+    Assert-Equal '1110001' (Get-DerivedStartupPin -ComputerName 'DEV-1').Pin
 }
 Test-Case 'derivation is deterministic across calls' {
-    Assert-Equal (Get-DerivedStartupPin -ComputerName 'WKH-0077').Pin (Get-DerivedStartupPin -ComputerName 'WKH-0077').Pin
+    Assert-Equal (Get-DerivedStartupPin -ComputerName 'DEV-0077').Pin (Get-DerivedStartupPin -ComputerName 'DEV-0077').Pin
 }
 Test-Case 'trailing whitespace in the name is tolerated' {
-    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'WKH-0051 ').Pin
+    Assert-Equal '1110051' (Get-DerivedStartupPin -ComputerName 'DEV-0051 ').Pin
 }
 Test-Case 'a name with no digits fails loudly rather than inventing a PIN' {
     Assert-Throws { Get-DerivedStartupPin -ComputerName 'LAPTOP-ABC' } 'no trailing device number'
@@ -104,28 +104,28 @@ Test-Case 'the hash fallback is stable for the same name' {
                  (Get-DerivedStartupPin -ComputerName 'LAPTOP-ABC' -AllowHashFallback).Pin
 }
 Test-Case 'a non-numeric prefix is rejected (pre-boot input is numeric only)' {
-    Assert-Throws { Get-DerivedStartupPin -ComputerName 'WKH-0051' -Prefix 'AB1' } 'digits only'
+    Assert-Throws { Get-DerivedStartupPin -ComputerName 'DEV-0051' -Prefix 'AB1' } 'digits only'
 }
 Test-Case 'a PIN shorter than 6 digits is rejected' {
-    Assert-Throws { Get-DerivedStartupPin -ComputerName 'WKH-1' -Prefix '' -NumberLength 4 } 'at least 6'
+    Assert-Throws { Get-DerivedStartupPin -ComputerName 'DEV-1' -Prefix '' -NumberLength 4 } 'at least 6'
 }
 Test-Case 'a PIN longer than 20 digits is rejected' {
-    Assert-Throws { Get-DerivedStartupPin -ComputerName 'WKH-1' -Prefix '111111111111' -NumberLength 12 } 'at most 20'
+    Assert-Throws { Get-DerivedStartupPin -ComputerName 'DEV-1' -Prefix '111111111111' -NumberLength 12 } 'at most 20'
 }
 Test-Case 'an empty computer name is rejected' {
     Assert-Throws { Get-DerivedStartupPin -ComputerName '  ' } 'empty'
 }
 Test-Case 'a very large device number still yields a legal PIN' {
-    $r = Get-DerivedStartupPin -ComputerName 'WKH-999999999999'
+    $r = Get-DerivedStartupPin -ComputerName 'DEV-999999999999'
     if ($r.Pin.Length -gt 20) { throw "too long: $($r.Pin.Length)" }
 }
 Test-Case 'derivation does not leak the device number into $Matches' {
     $global:Matches = $null
-    Get-DerivedStartupPin -ComputerName 'WKH-0051' | Out-Null
+    Get-DerivedStartupPin -ComputerName 'DEV-0051' | Out-Null
     if ($Matches -and ($Matches.Values -join '') -match '0051') { throw 'the device number leaked into $Matches' }
 }
 Test-Case 'the SecureString conversion round-trips to the same digits' {
-    $pin = (Get-DerivedStartupPin -ComputerName 'WKH-0051').Pin
+    $pin = (Get-DerivedStartupPin -ComputerName 'DEV-0051').Pin
     $sec = ConvertTo-PinSecureString -Pin $pin
     try {
         $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
@@ -175,7 +175,7 @@ Test-Case 'MinimumPIN below the platform floor of 6 is rejected' {
 }
 Test-Case 'the derived PIN satisfies the MinimumPIN the plan writes' {
     $plan = Get-FvePolicyPlan -MinimumPin 6
-    $pin  = (Get-DerivedStartupPin -ComputerName 'WKH-0051').Pin
+    $pin  = (Get-DerivedStartupPin -ComputerName 'DEV-0051').Pin
     if ($pin.Length -lt $plan['MinimumPIN']) { throw "PIN is $($pin.Length) digits, policy demands $($plan['MinimumPIN'])" }
 }
 
@@ -846,15 +846,40 @@ Test-Case 'detection and installer agree on the app version' {
     Assert-Equal $iv $dv 'a mismatch makes Intune reinstall forever'
 }
 
-Test-Case 'install, detect and uninstall agree on the organization and task name' {
-    $orgs = @(); $tasks = @()
-    foreach ($n in @('Install-BitLockerStartupPin.ps1','Detect-BitLockerStartupPin.ps1','Uninstall-BitLockerStartupPin.ps1')) {
-        $text  = Get-Content -LiteralPath (Join-Path $PSScriptRoot $n) -Raw
-        $orgs  += ([regex]::Match($text, '\$Organization\s*=\s*''([^'']+)''')).Groups[1].Value
-        $tasks += ([regex]::Match($text, '\$taskName\s*=\s*''([^'']+)''')).Groups[1].Value
+Test-Case 'every script agrees on the organization name' {
+    # -Organization is the one knob an adopter turns. It namespaces the registry
+    # key, the %ProgramData% folder and the scheduled task, so a file left on the
+    # old value silently looks at a different device state than the rest.
+    $files = @('Install-BitLockerStartupPin.ps1','Detect-BitLockerStartupPin.ps1',
+               'Uninstall-BitLockerStartupPin.ps1','Set-BitLockerPin.ps1',
+               'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1')
+    $seen = @{}
+    foreach ($n in $files) {
+        $text = Get-Content -LiteralPath (Join-Path $PSScriptRoot $n) -Raw
+        $org  = ([regex]::Match($text, '\$Organization\s*=\s*''([^'']+)''')).Groups[1].Value
+        if (-not $org) { throw "$n declares no `$Organization default" }
+        $seen[$n] = $org
     }
-    if (($orgs  | Sort-Object -Unique).Count -ne 1) { throw "organization differs: $($orgs -join ', ')" }
-    if (($tasks | Sort-Object -Unique).Count -ne 1) { throw "task name differs: $($tasks -join ', ')" }
+    $distinct = @($seen.Values | Sort-Object -Unique)
+    if ($distinct.Count -ne 1) {
+        throw ("organization differs: " + (($seen.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '))
+    }
+}
+
+Test-Case 'the task name is derived from the organization, never hardcoded' {
+    # Before this was derived, passing -Organization Contoso moved the registry and
+    # the payload folder but left the task called 'WK-Hub BitLocker PIN Enrollment' -
+    # so Set-BitLockerPin could not disable the task that launched it.
+    $files = @('Install-BitLockerStartupPin.ps1','Detect-BitLockerStartupPin.ps1',
+               'Uninstall-BitLockerStartupPin.ps1','Set-BitLockerPin.ps1',
+               'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1')
+    foreach ($n in $files) {
+        $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot $n)
+        if ($code -notmatch '\$taskName\s*=\s*"\$Organization BitLocker PIN Enrollment"') {
+            throw "$n does not derive `$taskName from `$Organization"
+        }
+        if ($code -match "TaskName\s+'") { throw "$n still passes a literal task name" }
+    }
 }
 
 if ($IncludeDryRunInstall) {

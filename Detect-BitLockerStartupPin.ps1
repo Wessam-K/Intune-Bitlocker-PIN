@@ -19,7 +19,7 @@ $Organization = 'WK-Hub'
 $AppVersion   = '3.1.0'
 
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
-$taskName = 'WK-Hub BitLocker PIN Enrollment'
+$taskName = "$Organization BitLocker PIN Enrollment"
 
 # %ProgramData% is not WOW64-redirected, so this resolves identically whether the
 # detection rule runs 32- or 64-bit - correctness must not depend on a portal toggle.

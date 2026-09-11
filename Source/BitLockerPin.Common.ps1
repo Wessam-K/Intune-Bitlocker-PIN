@@ -48,9 +48,9 @@ function Get-DerivedStartupPin {
     .DESCRIPTION
         Scheme: <Prefix><device number, zero-padded to NumberLength>
 
-            WKH-0051   -> 111 + 0051  -> 1110051
-            WKH-00051  -> 111 + 0051  -> 1110051    (same device number, 51)
-            WKH-10051  -> 111 + 10051 -> 11110051   (number wider than the pad)
+            DEV-0051   -> 111 + 0051  -> 1110051
+            DEV-00051  -> 111 + 0051  -> 1110051    (same device number, 51)
+            DEV-10051  -> 111 + 10051 -> 11110051   (number wider than the pad)
 
         The device number is the trailing digit run of the computer name, read as
         an integer (so leading zeros never change the value) and then padded back

@@ -67,7 +67,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 $root     = Join-Path $env:ProgramData "$Organization\BitLockerPin"
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
 $fveKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
-$taskName = 'WK-Hub BitLocker PIN Enrollment'
+$taskName = "$Organization BitLocker PIN Enrollment"
 $sysDrive = $env:SystemDrive
 $exitCode = 0
 
