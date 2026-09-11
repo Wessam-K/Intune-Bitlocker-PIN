@@ -346,11 +346,15 @@ Test-Case 'detection resolves paths identically under a 32-bit host' {
 }
 
 Test-Case 'Source\ payload is byte-identical to the root copies' {
-    # README.md packages the .intunewin from .\Source, so Source\ is what actually
-    # reaches devices - the root copies are for local reading and testing. A fix
+    # QUICKSTART.md step 5 packages the .intunewin from .\Source, so Source\ is what
+    # actually reaches devices - the root copies are what you read and edit. A fix
     # applied to only one side ships nothing. That has already happened once: a
     # hardening change to the install log path landed at root while Source\ kept
-    # the vulnerable version. Keep them identical, or drop the duplicates entirely.
+    # the vulnerable version.
+    #
+    # Source\ is no longer tracked, so on a fresh clone it is empty and the loop
+    # below has nothing to compare - which is the point. This guards the window
+    # between staging the files and building, when a stale copy can still ship.
     $srcDir = Join-Path $PSScriptRoot 'Source'
     if (-not (Test-Path $srcDir)) { throw 'Source\ is missing - packaging would have nothing to build from' }
     foreach ($f in Get-ChildItem $srcDir -File -Filter '*.ps1') {

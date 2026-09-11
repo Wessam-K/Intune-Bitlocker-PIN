@@ -209,7 +209,7 @@ these names:
 
 Any of the three can be omitted independently. The wordmark text and the fallback colour
 come from `Get-BrandXaml` in `BitLockerPin.Common.ps1`: the text is the `-Organization`
-value, and `-BrandColour` (default `#FF2E3A38`) is the same value as the window
+value, and `-BrandColour` (default `#FF16121F`) is the same value as the window
 background, so an unbranded window looks deliberate rather than broken. An upgrade that
 drops artwork the previous version had also removes the stale file from the device.
 

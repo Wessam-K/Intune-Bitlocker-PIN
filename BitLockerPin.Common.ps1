@@ -417,6 +417,64 @@ function Invoke-WithStartupAuthRelaxed {
     }
 }
 
+function Set-BrandedTitleBar {
+    <#
+    .SYNOPSIS
+        Paints the native Windows 11 title bar to match the window body.
+
+    .DESCRIPTION
+        A window whose body is near-black under a stock light caption looks
+        half-finished. DWM exposes caption, text and border colour on build
+        22000+, so the real minimise and close buttons, the drag behaviour,
+        snapping and accessibility all keep working - a hand-rolled caption bar
+        would lose every one of those. Older builds ignore the call and keep the
+        default caption, which is why nothing here is fatal.
+
+        Both windows call this, so the Add-Type is guarded: a second call with
+        the same namespace and name throws, and an unguarded throw here would
+        take down whichever window happened to open second.
+
+    .PARAMETER Window
+        The WPF window. Colours are applied once its handle exists.
+
+    .PARAMETER Colour
+        #RRGGBB. COLORREF is 0x00BBGGRR, so the bytes are reversed here rather
+        than at each call site, where a hand-swapped literal goes unnoticed
+        until someone wonders why the caption is the wrong colour.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Window,
+        [ValidatePattern('^#[0-9A-Fa-f]{6}$')]
+        [string] $Colour = '#16121F'
+    )
+
+    try {
+        if (-not ('Native.Dwm' -as [type])) {
+            Add-Type -Namespace 'Native' -Name 'Dwm' -MemberDefinition @'
+[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int value, int size);
+'@ -ErrorAction Stop
+        }
+
+        $r = [Convert]::ToInt32($Colour.Substring(1, 2), 16)
+        $g = [Convert]::ToInt32($Colour.Substring(3, 2), 16)
+        $b = [Convert]::ToInt32($Colour.Substring(5, 2), 16)
+        $colorRef = ($b -shl 16) -bor ($g -shl 8) -bor $r
+
+        $Window.Add_SourceInitialized({
+            try {
+                $hwnd    = (New-Object Windows.Interop.WindowInteropHelper $Window).Handle
+                $caption = $colorRef
+                $text    = 0xFFFFFF
+                [Native.Dwm]::DwmSetWindowAttribute($hwnd, 35, [ref]$caption, 4) | Out-Null  # DWMWA_CAPTION_COLOR
+                [Native.Dwm]::DwmSetWindowAttribute($hwnd, 36, [ref]$text,    4) | Out-Null  # DWMWA_TEXT_COLOR
+                [Native.Dwm]::DwmSetWindowAttribute($hwnd, 34, [ref]$caption, 4) | Out-Null  # DWMWA_BORDER_COLOR
+            } catch { }
+        }.GetNewClosure())
+    }
+    catch { }
+}
+
 function Get-BrandXaml {
     <#
     .SYNOPSIS
@@ -452,7 +510,7 @@ function Get-BrandXaml {
 
         # Fills the rail when no background image is available. Same value as the
         # window background, so the unbranded window looks deliberate, not broken.
-        [string] $BrandColour = '#FF2E3A38'
+        [string] $BrandColour = '#FF16121F'
     )
 
     $background = Join-Path $Root 'brand-background.png'
@@ -469,7 +527,7 @@ function Get-BrandXaml {
     $icon = if (Test-Path -LiteralPath $square) { ' Icon="{0}"' -f $xSquare } else { '' }
 
     $backdrop = if (Test-Path -LiteralPath $background) {
-        '<Image Source="{0}" Stretch="UniformToFill" HorizontalAlignment="Right"/><Border Background="#B32E3A38"/>' -f $xBackground
+        '<Image Source="{0}" Stretch="UniformToFill" HorizontalAlignment="Right"/><Border Background="#B316121F"/>' -f $xBackground
     } else {
         '<Border Background="{0}"/>' -f $BrandColour
     }

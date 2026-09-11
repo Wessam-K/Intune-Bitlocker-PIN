@@ -173,7 +173,32 @@ function Show-IssueNotice {
         Title="$Organization - device security" Height="480" Width="700"
         WindowStartupLocation="CenterScreen" WindowStyle="SingleBorderWindow"
         ResizeMode="CanMinimize" ShowInTaskbar="True" Topmost="True"$($brand.WindowIcon)
-        Background="#FF2E3A38" FontFamily="Segoe UI">
+        Background="#FF16121F" FontFamily="Segoe UI">
+  <Window.Resources>
+    <!-- The notice used the stock button, which reads as an unfinished window
+         once everything around it is themed. Same marquee treatment as the
+         dialog, kept minimal because this window has exactly one control. -->
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#FFD81B74"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Name="b" Background="{TemplateBinding Background}" CornerRadius="3">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#FFFF4D9D"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
     <Grid Grid.Column="0">
@@ -181,17 +206,17 @@ function Show-IssueNotice {
       $($brand.NoticeMark)
       $($brand.NoticeFooter)
     </Grid>
-    <Border Grid.Column="1" Background="#FFF7F8F8">
+    <Border Grid.Column="1" Background="#FFF6F4FA">
       <Grid Margin="34,30,34,24">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Name="h" FontSize="21" FontWeight="SemiBold" Foreground="#FF1F2A28" TextWrapping="Wrap" Margin="0,0,0,12"/>
-        <TextBlock Grid.Row="1" Name="b" FontSize="13" Foreground="#FF4C5957" TextWrapping="Wrap" LineHeight="20"/>
-        <Border Grid.Row="2" Name="refBox" Background="#FFEFF4F3" BorderBrush="#FFD8E1DF" BorderThickness="1"
+        <TextBlock Grid.Row="0" Name="h" FontSize="21" FontWeight="SemiBold" Foreground="#FF1A1526" TextWrapping="Wrap" Margin="0,0,0,12"/>
+        <TextBlock Grid.Row="1" Name="b" FontSize="13" Foreground="#FF4A4360" TextWrapping="Wrap" LineHeight="20"/>
+        <Border Grid.Row="2" Name="refBox" Background="#FFF0FBFC" BorderBrush="#FFCFEEF0" BorderThickness="1"
                 CornerRadius="3" Padding="12,9" Margin="0,16,0,0" Visibility="Collapsed">
-          <TextBlock Name="r" FontFamily="Consolas" FontSize="12.5" Foreground="#FF2E3A38" TextWrapping="Wrap"/>
+          <TextBlock Name="r" FontFamily="Consolas" FontSize="12.5" Foreground="#FF0E7C86" TextWrapping="Wrap"/>
         </Border>
         <Button Grid.Row="4" Name="ok" Content="Close" Width="120" Height="36"
                 HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,18,0,0" Cursor="Hand"/>
@@ -201,6 +226,7 @@ function Show-IssueNotice {
 </Window>
 "@
         $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+        Set-BrandedTitleBar -Window $w
         $w.FindName('h').Text = $Heading
         $w.FindName('b').Text = $Body
         if ($Reference) {
@@ -446,11 +472,11 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
         WindowStartupLocation="CenterScreen"
         WindowStyle="SingleBorderWindow" ResizeMode="CanMinimize"
         ShowInTaskbar="True" Topmost="True"$($brand.WindowIcon)
-        Background="#FF2E3A38" FontFamily="Segoe UI">
+        Background="#FF16121F" FontFamily="Segoe UI">
 
   <Window.Resources>
     <Style x:Key="Primary" TargetType="Button">
-      <Setter Property="Background" Value="#FF2E3A38"/>
+      <Setter Property="Background" Value="#FFD81B74"/>
       <Setter Property="Foreground" Value="White"/>
       <Setter Property="FontSize" Value="14"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
@@ -463,10 +489,10 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="b" Property="Background" Value="#FF3D4F4C"/>
+                <Setter TargetName="b" Property="Background" Value="#FFFF4D9D"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
-                <Setter TargetName="b" Property="Background" Value="#FFB9C1C0"/>
+                <Setter TargetName="b" Property="Background" Value="#FFBDB6CC"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -475,17 +501,17 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
     </Style>
 
     <Style x:Key="Ghost" TargetType="Button" BasedOn="{StaticResource Primary}">
-      <Setter Property="Foreground" Value="#FF2E3A38"/>
+      <Setter Property="Foreground" Value="#FF1A1526"/>
       <Setter Property="FontWeight" Value="Normal"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border Name="b" Background="Transparent" BorderBrush="#FFBFC7C6" BorderThickness="1" CornerRadius="3">
+            <Border Name="b" Background="Transparent" BorderBrush="#FFCFC9DE" BorderThickness="1" CornerRadius="3">
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="b" Property="Background" Value="#FFEDEFEF"/>
+                <Setter TargetName="b" Property="Background" Value="#FFEDEAF5"/>
               </Trigger>
               <Trigger Property="IsEnabled" Value="False">
                 <Setter TargetName="b" Property="Opacity" Value="0.45"/>
@@ -501,7 +527,7 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
       <Setter Property="FontSize" Value="18"/>
       <Setter Property="FontFamily" Value="Consolas"/>
       <Setter Property="Padding" Value="10,8"/>
-      <Setter Property="BorderBrush" Value="#FFC4CCCB"/>
+      <Setter Property="BorderBrush" Value="#FFD9D4E6"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="MaxLength" Value="20"/>
       <Setter Property="Background" Value="White"/>
@@ -519,8 +545,14 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
       $($brand.Backdrop)
       <StackPanel Margin="30,34,30,30" VerticalAlignment="Top">
         $($brand.DialogMark)
+        <TextBlock Text="P R E - B O O T" FontFamily="Consolas" FontSize="11"
+                   Foreground="#FF5CE1E6" Margin="0,0,0,7"/>
         <TextBlock Text="Device security" Foreground="#FFFFFFFF" FontSize="21" FontWeight="SemiBold" TextWrapping="Wrap"/>
-        <Rectangle Height="1" Fill="#59FFFFFF" Margin="0,16,0,16"/>
+        <Grid Width="132" HorizontalAlignment="Left" Margin="0,16,0,16">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="78"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+          <Rectangle Grid.Column="0" Height="2" Fill="#FF5CE1E6"/>
+          <Rectangle Grid.Column="1" Height="2" Fill="#FFD81B74"/>
+        </Grid>
         <TextBlock Foreground="#CCFFFFFF" FontSize="12.5" TextWrapping="Wrap" LineHeight="19">
           This drive is encrypted with BitLocker. A startup PIN adds a second step
           before Windows loads, so a stolen device cannot simply be switched on.
@@ -530,7 +562,7 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
     </Grid>
 
     <!-- Form -->
-    <Border Grid.Column="1" Background="#FFF7F8F8">
+    <Border Grid.Column="1" Background="#FFF6F4FA">
       <Grid Margin="38,34,38,28">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
@@ -541,34 +573,34 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0" Text="Choose your startup PIN" FontSize="24" FontWeight="SemiBold"
-                   Foreground="#FF1F2A28" Margin="0,0,0,8"/>
+                   Foreground="#FF1A1526" Margin="0,0,0,8"/>
 
-        <TextBlock Grid.Row="1" Foreground="#FF5A6664" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,22" LineHeight="20">
+        <TextBlock Grid.Row="1" Foreground="#FF6B6480" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,22" LineHeight="20">
           You will type this every time <Run FontWeight="SemiBold" Name="runDevice"/> starts, before Windows loads.
           Choose something you will remember - IT cannot look it up for you.
         </TextBlock>
 
         <TextBlock Grid.Row="2" Name="lblPin" FontSize="12.5" FontWeight="SemiBold"
-                   Foreground="#FF1F2A28" Margin="0,0,0,6"/>
+                   Foreground="#FF1A1526" Margin="0,0,0,6"/>
         <PasswordBox Grid.Row="3" Name="pbPin" Margin="0,0,0,16"/>
 
         <TextBlock Grid.Row="4" Text="Confirm PIN" FontSize="12.5" FontWeight="SemiBold"
-                   Foreground="#FF1F2A28" Margin="0,0,0,6"/>
+                   Foreground="#FF1A1526" Margin="0,0,0,6"/>
         <PasswordBox Grid.Row="5" Name="pbConfirm"/>
 
-        <Border Grid.Row="6" Background="#FFEFF4F3" BorderBrush="#FFD8E1DF" BorderThickness="1"
+        <Border Grid.Row="6" Background="#FFF0FBFC" BorderBrush="#FFCFEEF0" BorderThickness="1"
                 CornerRadius="3" Padding="14,11" Margin="0,18,0,0">
           <StackPanel>
             <TextBlock Text="Before you choose" FontSize="12" FontWeight="SemiBold"
-                       Foreground="#FF2E3A38" Margin="0,0,0,7"/>
-            <TextBlock Name="lblRules" Foreground="#FF4C5957" FontSize="12" TextWrapping="Wrap" LineHeight="18"/>
+                       Foreground="#FF0E7C86" Margin="0,0,0,7"/>
+            <TextBlock Name="lblRules" Foreground="#FF4A4360" FontSize="12" TextWrapping="Wrap" LineHeight="18"/>
           </StackPanel>
         </Border>
 
-        <Border Grid.Row="7" Name="pnlStatus" Background="#FFFDEDEF" BorderBrush="#FFF3C9CE"
+        <Border Grid.Row="7" Name="pnlStatus" Background="#FFFFEBF1" BorderBrush="#FFFFC9DC"
                 BorderThickness="1" CornerRadius="3" Padding="12,9" Margin="0,12,0,0"
                 VerticalAlignment="Top" Visibility="Collapsed">
-          <TextBlock Name="lblStatus" TextWrapping="Wrap" FontSize="12.5" Foreground="#FF8E1C2B"/>
+          <TextBlock Name="lblStatus" TextWrapping="Wrap" FontSize="12.5" Foreground="#FFC01A56"/>
         </Border>
 
         <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
@@ -584,29 +616,9 @@ $brand = Get-BrandXaml -Root $root -BrandName $Organization
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $win    = [Windows.Markup.XamlReader]::Load($reader)
 
-# Paint the native title bar in the brand colour instead of building custom chrome.
-# Windows 11 (build 22000+) exposes this through DWM, so the real minimise/close
-# buttons, the drag behaviour, snapping and accessibility all keep working - a
-# hand-rolled caption bar would lose those. Silently ignored on older builds,
-# which just keep the default light caption.
-try {
-    Add-Type -Namespace 'Native' -Name 'Dwm' -MemberDefinition @'
-[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int value, int size);
-'@ -ErrorAction Stop
-
-    $win.Add_SourceInitialized({
-        try {
-            $hwnd = (New-Object Windows.Interop.WindowInteropHelper $win).Handle
-            # COLORREF is 0x00BBGGRR, not RGB: #2E3A38 -> 0x383A2E
-            $caption = 0x383A2E
-            $text    = 0xFFFFFF
-            $border  = 0x383A2E
-            [Native.Dwm]::DwmSetWindowAttribute($hwnd, 35, [ref]$caption, 4) | Out-Null  # DWMWA_CAPTION_COLOR
-            [Native.Dwm]::DwmSetWindowAttribute($hwnd, 36, [ref]$text,    4) | Out-Null  # DWMWA_TEXT_COLOR
-            [Native.Dwm]::DwmSetWindowAttribute($hwnd, 34, [ref]$border,  4) | Out-Null  # DWMWA_BORDER_COLOR
-        } catch { }
-    })
-} catch { }
+# Paint the native title bar to match the window instead of building custom
+# chrome. See Set-BrandedTitleBar in BitLockerPin.Common.ps1.
+Set-BrandedTitleBar -Window $win
 
 $pbPin     = $win.FindName('pbPin')
 $pbConfirm = $win.FindName('pbConfirm')
@@ -633,14 +645,14 @@ function Show-Status {
     param([string] $Text, [switch] $Info)
     $lblStatus.Text = $Text
     if ($Info) {
-        $pnlStatus.Background  = '#FFEFF4F3'
-        $pnlStatus.BorderBrush = '#FFC9D6D4'
-        $lblStatus.Foreground  = '#FF2E3A38'
+        $pnlStatus.Background  = '#FFF0FBFC'
+        $pnlStatus.BorderBrush = '#FFCFEEF0'
+        $lblStatus.Foreground  = '#FF0E7C86'
     }
     else {
-        $pnlStatus.Background  = '#FFFDEDEF'
-        $pnlStatus.BorderBrush = '#FFF3C9CE'
-        $lblStatus.Foreground  = '#FF8E1C2B'
+        $pnlStatus.Background  = '#FFFFEBF1'
+        $pnlStatus.BorderBrush = '#FFFFC9DC'
+        $lblStatus.Foreground  = '#FFC01A56'
     }
     $pnlStatus.Visibility = 'Visible'
 }

@@ -47,7 +47,7 @@ normal image slot.
 
 ```xml
 <Image Source="brand-background.png" Stretch="UniformToFill" HorizontalAlignment="Right"/>
-<Border Background="#B32E3A38"/>
+<Border Background="#B316121F"/>
 ```
 
 Three consequences, and all three matter:
@@ -61,7 +61,7 @@ Three consequences, and all three matter:
    image is wider than the rail, the *right* edge is kept and the left is cut.
    Put your focal point on the right-hand side of the file.
 
-3. **A ~70 %-opaque dark scrim (`#B32E3A38`) is painted over the whole thing.**
+3. **A ~70 %-opaque dark scrim (`#B316121F`) is painted over the whole thing.**
    This is not optional and not configurable — it is what keeps the white
    headings and body text readable over arbitrary artwork. So:
    - Bright, high-contrast, or busy images come out muddy. Pick something with
@@ -78,18 +78,38 @@ and set the rail colour (see below).
 
 ## Colours
 
-| Knob | Default | What it does |
+The palette is an arcade cabinet: a violet-black body, CRT phosphor cyan, and a
+magenta marquee. The rail carries all of it. The form panel stays quiet, because
+a security prompt that looks like a game gets dismissed or reported as phishing.
+
+| Token | Value | Where it is used |
 |---|---|---|
-| `-BrandColour` on `Get-BrandXaml` | `#FF2E3A38` | Fills the rail when there is no `brand-background.png`. It is the same value as the window background, so an unbranded rail reads as a design choice |
-| Window background (in the XAML) | `#FF2E3A38` | Also painted onto the **native Windows 11 title bar** through DWM, so the real minimise/close buttons, snapping and accessibility all keep working — a hand-rolled caption bar would lose those. Silently ignored on Windows 10 |
-| Rail scrim | `#B32E3A38` | Fixed. See above |
+| Cabinet | `#FF16121F` | Rail fallback (`-BrandColour` on `Get-BrandXaml`), window background, and the native title bar — painted through DWM by `Set-BrandedTitleBar`, so the real minimise/close buttons, snapping and accessibility keep working. Silently ignored on Windows 10, which keeps its default caption |
+| Rail scrim | `#B316121F` | Over the wallpaper. Fixed |
+| Phosphor | `#FF5CE1E6` | The `PRE-BOOT` eyebrow and the left half of the rule. **Dark surfaces only** |
+| Phosphor deep | `#FF0E7C86` | The same cyan as text on the light panel, darkened to clear 4.5:1 |
+| Marquee | `#FFD81B74` | Primary button. Darkened from the brighter tone so white text on it clears 4.5:1 |
+| Marquee lift | `#FFFF4D9D` | Button hover, and the right half of the rule |
+| Screen | `#FFF6F4FA` | Form panel |
+| Ink | `#FF1A1526` | Body text on the panel |
 
 All are `#AARRGGBB` — alpha first. `FF` is opaque, `B3` is ~70 %.
 
-To change the palette, edit `Get-BrandXaml` in `BitLockerPin.Common.ps1` and the
-`Background=` attributes in the two XAML blocks in `Set-BitLockerPin.ps1`. Keep
-the rail colour and the window background identical, or the unbranded fallback
-looks like a rendering bug.
+**The rail is where the personality lives.** Its eyebrow is set in spaced
+monospace (`P R E - B O O T`) because WPF has no character-spacing property and
+that register is the point — it names the boot stage, which is real information,
+not decoration. The rule under the heading is two-tone, cyan into magenta,
+introducing both accents before either is used for anything functional.
+
+To change the palette, edit `Get-BrandXaml` in `BitLockerPin.Common.ps1`, the
+`Background=` attributes in the two XAML blocks in `Set-BitLockerPin.ps1`, and
+the `-Colour` default on `Set-BrandedTitleBar`. Keep the rail colour, the window
+background and the title bar identical, or the unbranded fallback looks like a
+rendering bug.
+
+If you re-theme, check contrast on the two that carry text: white on the primary
+button, and the phosphor-deep label on the tinted panel. Both sit just above
+4.5:1 by design, so a small lightening breaks them.
 
 ---
 
