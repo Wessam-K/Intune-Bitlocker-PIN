@@ -47,7 +47,7 @@ if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') {
 }
 
 $sysDrive = $env:SystemDrive
-$taskName = 'WK-Hub BitLocker PIN Enrollment'
+$taskName = "$Organization BitLocker PIN Enrollment"
 $fveKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
 $root     = Join-Path $env:ProgramData "$Organization\BitLockerPin"
 $actions  = @()

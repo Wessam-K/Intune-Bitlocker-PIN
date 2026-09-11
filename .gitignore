@@ -28,6 +28,11 @@ _sandbox/
 brand-*.png
 *-logo-*.png
 
+# ...except the reference artwork under docs/. Those three PNGs are dimensions
+# and format, not anyone's brand, and BRANDING.md tells adopters to copy them.
+!docs/branding-sample/
+!docs/branding-sample/*.png
+
 # ── Editor / OS ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/

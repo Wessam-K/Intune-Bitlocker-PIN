@@ -34,12 +34,16 @@
 #>
 [CmdletBinding()]
 param(
-    # Vendor namespace: the registry key, the %ProgramData% folder, the task
-    # author and the wordmark shown when no logo image is supplied all hang off
-    # this. It must contain no whitespace - ServiceUI strips quotes from the
-    # command line it forwards, so a name with a space would arrive split, and
-    # the guard further down refuses to register the task in that case.
-    # Change it here, in Set-BitLockerPin.ps1, Detect-*.ps1, Remediate-*.ps1 and
+    # Vendor namespace: the registry key, the %ProgramData% folder, the scheduled
+    # task name, the task author and the wordmark shown when no logo image is
+    # supplied all hang off this. It must contain no whitespace - ServiceUI strips
+    # quotes from the command line it forwards, so a name with a space would arrive
+    # split, and the guard further down refuses to register the task in that case.
+    #
+    # Intune passes it here and this script forwards it to the dialog, but the
+    # detection and remediation scripts are uploaded to Intune on their own and
+    # take no arguments - so their defaults have to be edited to match. Change it
+    # here, in Set-BitLockerPin.ps1, Detect-*.ps1, Remediate-*.ps1 and
     # Uninstall-*.ps1 together; Test-BitLockerPinApp.ps1 asserts they agree.
     [string] $Organization = 'WK-Hub',
 
@@ -126,7 +130,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 $root     = Join-Path $env:ProgramData "$Organization\BitLockerPin"
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
 $fveKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
-$taskName = 'WK-Hub BitLocker PIN Enrollment'
+$taskName = "$Organization BitLocker PIN Enrollment"
 $sysDrive = $env:SystemDrive
 
 # Files the app genuinely cannot run without. ServiceUI.exe is Microsoft's and is
