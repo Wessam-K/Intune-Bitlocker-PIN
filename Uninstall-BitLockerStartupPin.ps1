@@ -68,6 +68,8 @@ $root     = Join-Path $env:ProgramData "$Organization\BitLockerPin"
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
 $fveKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
 $taskName = "$Organization BitLocker PIN Enrollment"
+$resetTaskName = "$Organization BitLocker PIN Reset"
+$shortcutPath  = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Reset BitLocker PIN.lnk'
 $sysDrive = $env:SystemDrive
 $exitCode = 0
 
@@ -81,6 +83,25 @@ $script:LogFile = if (Test-Path $root) { Join-Path $root 'uninstall.log' }
 Stop-ScheduledTask       -TaskName $taskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 Write-PinLog "Removed scheduled task '$taskName' (if present)."
+
+# The self-service artefacts. The reset task matters most: it is the one task in
+# this app an ordinary user is allowed to start, so leaving it behind would strand
+# a user-startable SYSTEM task pointing at a payload directory that is about to be
+# deleted.
+Stop-ScheduledTask       -TaskName $resetTaskName -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $resetTaskName -Confirm:$false -ErrorAction SilentlyContinue
+Write-PinLog "Removed scheduled task '$resetTaskName' (if present)."
+
+if (Test-Path -LiteralPath $shortcutPath) {
+    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+    Write-PinLog 'Removed the Start-menu shortcut.'
+}
+
+# The event source is deliberately LEFT REGISTERED. Removing it orphans the reset
+# events already in the Application log - they stay present but render as "the
+# description for Event ID cannot be found", which destroys the audit trail for
+# every reset this device performed. An unused source costs nothing.
+Write-PinLog 'Left the event source registered so historic reset events stay readable.'
 
 # Release the staged ServiceUI.exe, or the folder removal below leaves it behind.
 Get-Process -Name 'ServiceUI' -ErrorAction SilentlyContinue |

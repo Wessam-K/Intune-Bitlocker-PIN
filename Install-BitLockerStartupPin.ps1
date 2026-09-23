@@ -13,14 +13,16 @@
          password is escrowed to Entra ID - BEFORE any protector is touched.
       5. Stage the dialog, ServiceUI.exe and any brand images that are present.
       6. Register a scheduled task that runs the dialog in the USER's session.
-      7. Write the detection marker.
+      7. Register the self-service reset: a trigger-less task the user may start,
+         its Start-menu shortcut, and the event source its audit events use.
+      8. Write the detection marker.
 
     It deliberately does not prompt by itself: session 0 has no interactive
     desktop, which is why 'manage-bde -changepin' silently fails when a Win32 app
     calls it directly. ServiceUI.exe hooks explorer.exe to borrow that session's
-    desktop while the process stays SYSTEM - which is required, because standard users
-    are not administrators on their own devices and adding a key protector needs
-    admin rights.
+    desktop while the process stays SYSTEM - which is required, because standard
+    users are not administrators on their own devices and adding a key protector
+    needs admin rights.
 
     The PIN itself is chosen by the user in Set-BitLockerPin.ps1.
     -AssignDerivedPin flips to the unattended scheme (PIN derived from the device
@@ -50,7 +52,10 @@ param(
     [ValidateRange(6,20)]
     [int]    $MinimumPin = 6,
 
-    [string] $AppVersion = '3.1.0',
+    # Detect-BitLockerStartupPin.ps1 carries the same constant and compares it
+    # against the Version written below, so the two must move together or every
+    # device reports "not installed" forever. 3.3.0 added the self-service reset.
+    [string] $AppVersion = '3.3.0',
 
     # SHA256 of the x64 ServiceUI.exe you supply (see README, "Binaries you must
     # supply yourself"). The default is the MDT 8456 build; if you take the
@@ -132,6 +137,14 @@ $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
 $fveKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
 $taskName = "$Organization BitLocker PIN Enrollment"
 $sysDrive = $env:SystemDrive
+
+# The self-service task. Separate from the enrolment task on purpose: that one is
+# ACL'd so no ordinary user can start it, and this one must be startable by
+# exactly the people it is for. Keeping them apart means widening the ACL here
+# cannot widen it there.
+$resetTaskName = "$Organization BitLocker PIN Reset"
+$shortcutPath  = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Reset BitLocker PIN.lnk'
+$eventSource   = "$Organization-BitLockerPin"
 
 # Files the app genuinely cannot run without. ServiceUI.exe is Microsoft's and is
 # NOT redistributed in this package - the operator drops their own copy in beside
@@ -656,6 +669,83 @@ try {
             Write-PinLog 'Restricted the task security descriptor to SYSTEM and Administrators.'
         }
         catch { Write-PinLog "Could not tighten the task ACL: $($_.Exception.Message)" 'WARN' }
+
+        # ------------------------------------------------------------------
+        # Self-service reset
+        #
+        # A second task, with no triggers at all: it exists only to be started on
+        # demand from the Start-menu shortcut. Nothing schedules it, so it can
+        # never prompt anybody on its own.
+        #
+        # This one IS deliberately user-startable, which reverses the rule applied
+        # to the enrolment task a few lines above. That is the whole point - a user
+        # who has forgotten their PIN is not an administrator and cannot elevate,
+        # so the only way to let them fix it themselves is to let them start a
+        # SYSTEM task. What stops that becoming a hole is inside Set-BitLockerPin
+        # -Manage, which refuses unless the caller is the device's enrolled user,
+        # the device is under its daily reset limit, AND the person at the keyboard
+        # confirms who they are with Windows Hello (or their Windows password).
+        # Starting the task is not the privilege; passing those gates is.
+        #
+        # None of the three steps below may fail the install. Without them a user
+        # falls back to the service desk for a reset, which is where they were
+        # before this feature existed.
+        # ------------------------------------------------------------------
+        try {
+            $resetArgs = '-process:explorer.exe {0} -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {1} -Organization {2} -MinimumPin {3} -Manage' -f `
+                            $psExe, $dialog, $Organization, $MinimumPin
+
+            $rAction    = New-ScheduledTaskAction -Execute $serviceUi -Argument $resetArgs -WorkingDirectory $root
+            $rPrincipal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+            $rSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                             -StartWhenAvailable -MultipleInstances IgnoreNew `
+                             -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+
+            Unregister-ScheduledTask -TaskName $resetTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Register-ScheduledTask -TaskName $resetTaskName `
+                                   -Description 'Lets the assigned user of this device reset their BitLocker startup PIN after confirming their identity with Windows Hello or their Windows password.' `
+                                   -Action $rAction -Principal $rPrincipal -Settings $rSettings -ErrorAction Stop | Out-Null
+
+            # GR alone lets a user see the task but not start it, which is what the
+            # enrolment task gets. GX is what actually makes it runnable, and is the
+            # single bit that makes self-service possible.
+            $svc2 = New-Object -ComObject Schedule.Service
+            $svc2.Connect()
+            $svc2.GetFolder('\').GetTask($resetTaskName).SetSecurityDescriptor('D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;AU)', 0)
+            Write-PinLog "Registered '$resetTaskName' (no triggers, startable by authenticated users)."
+        }
+        catch { Write-PinLog "Could not register the self-service reset task: $($_.Exception.Message)" 'WARN' }
+
+        # The Start-menu shortcut is the only part of this the user ever sees.
+        # It targets schtasks rather than the dialog directly: launched from the
+        # shortcut the script would run as the USER, who cannot touch a key
+        # protector. Starting the task is what gets it to SYSTEM.
+        try {
+            $ws = New-Object -ComObject WScript.Shell
+            $sc = $ws.CreateShortcut($shortcutPath)
+            $sc.TargetPath       = "$env:SystemRoot\System32\schtasks.exe"
+            $sc.Arguments        = "/run /tn `"$resetTaskName`""
+            $sc.Description      = 'Set a new BitLocker startup PIN for this computer'
+            $sc.WorkingDirectory = "$env:SystemRoot\System32"
+            # fvecpl.dll is the BitLocker control-panel icon, so the shortcut looks
+            # like what it is. The brand images are PNGs and cannot be used here.
+            $sc.IconLocation     = "$env:SystemRoot\System32\fvecpl.dll,0"
+            $sc.WindowStyle      = 7   # minimised: schtasks flashes a console otherwise
+            $sc.Save()
+            Write-PinLog "Created the Start-menu shortcut at $shortcutPath."
+        }
+        catch { Write-PinLog "Could not create the Start-menu shortcut: $($_.Exception.Message)" 'WARN' }
+
+        # Registering the event source needs admin, so it happens here rather than
+        # from the dialog. Without it Write-PinAudit still writes to prompt.log; the
+        # difference is whether a reset is visible off the device.
+        try {
+            if (-not [System.Diagnostics.EventLog]::SourceExists($eventSource)) {
+                New-EventLog -LogName Application -Source $eventSource -ErrorAction Stop
+                Write-PinLog "Created the '$eventSource' event source (reset audit events 3200-3204)."
+            }
+        }
+        catch { Write-PinLog "Could not create the event source: $($_.Exception.Message)" 'WARN' }
 
         # Fire once now in case someone is already signed in.
         try   { Start-ScheduledTask -TaskName $taskName; Write-PinLog 'Started the task immediately.' }

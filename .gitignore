@@ -21,6 +21,11 @@ Source/*
 # Ignored here so a local copy is never committed by accident.
 IntuneWinAppUtil.exe
 ServiceUI.exe
+# This product ships no binaries at all, so no executable belongs in the repo.
+*.exe
+
+# A local Intune app manifest names your tenant, groups and app ids.
+intune/package.json
 
 # ── Runtime / test output ───────────────────────────────────────────────────
 # Install, uninstall and prompt logs can name devices and users.
@@ -35,6 +40,9 @@ _sandbox/
 # you would rather track your branding in your fork.
 brand-*.png
 *-logo-*.png
+# Any other artwork dropped next to the scripts stays local too. The only images
+# this repo publishes live under docs/.
+/*.png
 
 # ...except the reference artwork under docs/. Those three PNGs are dimensions
 # and format, not anyone's brand, and BRANDING.md tells adopters to copy them.

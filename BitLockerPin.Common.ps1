@@ -9,6 +9,8 @@
       * FVE policy planning (the "safe" value set)
       * staging-path validation and hardening
       * escrow / protector verification against the BitLocker event log
+      * the self-service reset: its three gates (identity, throttle,
+        re-authentication) and its audit trail
 
     Everything here must work in Windows PowerShell 5.1 running as SYSTEM.
 #>
@@ -430,7 +432,7 @@ function Set-BrandedTitleBar {
         would lose every one of those. Older builds ignore the call and keep the
         default caption, which is why nothing here is fatal.
 
-        Both windows call this, so the Add-Type is guarded: a second call with
+        Every window calls this, so the Add-Type is guarded: a second call with
         the same namespace and name throws, and an unguarded throw here would
         take down whichever window happened to open second.
 
@@ -478,7 +480,7 @@ function Set-BrandedTitleBar {
 function Get-BrandXaml {
     <#
     .SYNOPSIS
-        XAML fragments for the OPTIONAL brand images used by the two windows.
+        XAML fragments for the OPTIONAL brand images used by the windows.
 
     .DESCRIPTION
         Branding is a drop-in, never a dependency. Put your own PNGs next to the
@@ -625,3 +627,817 @@ function Test-PinChangedByUser {
     try { @(Get-WinEvent -FilterHashtable $filter -MaxEvents 50 -ErrorAction Stop).Count -gt 0 }
     catch { $false }
 }
+
+# ======================================================================
+# Self-service PIN reset
+#
+# Windows' own "change PIN" needs the OLD PIN, so it is no help to someone who
+# has forgotten it. Replacing the protector is the only route, and that needs
+# admin rights a standard user does not have - hence a SYSTEM task they are
+# allowed to start.
+#
+# Three gates stand between "any signed-in user" and "replace the PIN every
+# user of this device must type at boot", and each fails CLOSED: the caller
+# must be the device's enrolled user, the device must be under its reset limit,
+# and the person at the keyboard must prove who they are - with Windows Hello,
+# or with their Windows password where Hello cannot run.
+# ======================================================================
+
+function Get-EnrolledUpn {
+    <#
+    .SYNOPSIS
+        UPN of the account that enrolled this device into Intune, or $null.
+
+    .DESCRIPTION
+        The closest thing to Intune's "primary user" that can be read locally.
+
+        Intune's primaryUser field lives in Graph and needs a token, which a SYSTEM
+        task on a laptop with no network cannot get. The MDM enrolment key carries
+        the enrolling user's UPN and is written during user-driven enrolment
+        (Autopilot user-driven, or a user joining the device from Settings) - and
+        for a device enrolled that way the two agree.
+
+        Where they disagree: a device handed to a new owner without re-enrolment
+        keeps the old UPN, and a device enrolled by a service account (a device
+        enrolment manager, a provisioning package, self-deploying Autopilot)
+        carries that account or none. Self-service is refused on both. That is the
+        intended direction of failure. Being sent to the service desk is
+        recoverable; letting any signed-in user re-PIN a device that is not theirs
+        is not.
+    #>
+    try {
+        foreach ($k in (Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction Stop)) {
+            # A real MDM enrolment carries both values. The numeric subkeys beneath
+            # them are per-resource and carry neither.
+            $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+            if ($p.UPN -and $p.ProviderID) { return [string]$p.UPN }
+        }
+    } catch { }
+    $null
+}
+
+function Get-ConsoleUser {
+    <#
+    .SYNOPSIS
+        SID and UPN of the person at the physical console, or $null if unknowable.
+
+    .DESCRIPTION
+        Built on Get-ConsoleSessionId rather than on whoever owns the explorer.exe
+        ServiceUI happened to attach to: with fast user switching or an RDP session
+        those differ, and the wrong answer here would let a lower-trust user reset
+        the PIN every user of the device must type at boot.
+
+        $null means "cannot tell", and every caller must treat it as a refusal.
+    #>
+    $id = Get-ConsoleSessionId
+    if ($null -eq $id) { return $null }
+
+    $sid = $null
+    try {
+        $proc = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$id" -ErrorAction Stop)[0]
+        if ($proc) { $sid = (Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop).Sid }
+    } catch { }
+    if (-not $sid) { return $null }
+
+    # IdentityStore is where Windows caches the UPN of an Entra account. A local
+    # account has no entry, and that absence is the correct answer rather than a
+    # failure: a local account is never the Intune primary user.
+    $upn = $null
+    try {
+        $p = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$sid\IdentityCache\$sid" -ErrorAction Stop
+        if ($p.UserName) { $upn = [string]$p.UserName }
+    } catch { }
+
+    [pscustomobject]@{ SessionId = $id; Sid = $sid; Upn = $upn }
+}
+
+function Test-ConsoleUserIsPrimary {
+    <#
+    .SYNOPSIS
+        Is the person at the console the device's own user? Fails closed.
+    #>
+    param([string] $EnrolledUpn, $ConsoleUser)
+
+    if (-not $EnrolledUpn)     { Write-PinLog 'No MDM enrolment UPN on this device - cannot establish the primary user.' 'WARN'; return $false }
+    if (-not $ConsoleUser)     { Write-PinLog 'Console session could not be identified.' 'WARN'; return $false }
+    if (-not $ConsoleUser.Upn) { Write-PinLog "Console user $($ConsoleUser.Sid) has no cached UPN - a local account is never the primary user." 'WARN'; return $false }
+
+    $match = $ConsoleUser.Upn.Trim() -ieq $EnrolledUpn.Trim()
+    if (-not $match) { Write-PinLog "Console user $($ConsoleUser.Upn) is not the enrolled user $EnrolledUpn." 'WARN' }
+    $match
+}
+
+function Test-WindowsPassword {
+    <#
+    .SYNOPSIS
+        Validates a password against an account. $true only on a genuine logon.
+
+    .DESCRIPTION
+        The fallback re-authentication, used only when Windows Hello cannot run.
+
+        LOGON32_LOGON_INTERACTIVE validates against cached credentials, so this
+        works on a laptop with no line of sight to Entra - which is exactly the
+        machine whose user is locked out and needs a new PIN. It needs a cached
+        password verifier, though, and Windows only holds one for an account that
+        has signed in to this device with its password. On an Entra-joined device
+        whose user has only ever used Windows Hello there is none, and LogonUser
+        answers ERROR_LOGON_FAILURE (1326) even for the correct password. That is
+        why Hello is asked first.
+
+        The password goes SecureString -> unmanaged BSTR -> the API and is
+        zero-freed. It never becomes a System.String, which cannot be zeroed and
+        would linger in this long-lived SYSTEM process's heap, the page file and
+        any crash dump. Same reasoning as Test-PinSecure.
+
+        Add-Type invokes the C# compiler, which on a hardened fleet can be blocked
+        by EDR or WDAC - the risk Get-ConsoleSessionId documents. There is no
+        compile-free way to verify a credential, so this fails CLOSED: no
+        verification means no reset.
+    #>
+    param(
+        [Parameter(Mandatory)][string]       $Upn,
+        [Parameter(Mandatory)][securestring] $Password
+    )
+
+    try {
+        Add-Type -MemberDefinition @'
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool LogonUser(string user, string domain, IntPtr password, int logonType, int logonProvider, out IntPtr token);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool CloseHandle(IntPtr handle);
+'@ -Name 'Logon' -Namespace 'PinAuth' -ErrorAction Stop
+    }
+    catch {
+        Write-PinLog "Cannot verify the password - P/Invoke unavailable: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    $ptr   = [IntPtr]::Zero
+    $token = [IntPtr]::Zero
+    try {
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Password)
+        # Domain $null with a UPN-form username is what binds for an Entra account.
+        $ok = [PinAuth.Logon]::LogonUser($Upn, $null, $ptr, 2, 0, [ref]$token)
+        if (-not $ok) {
+            Write-PinLog "Password check failed for $Upn (Win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." 'WARN'
+        }
+        [bool]$ok
+    }
+    catch {
+        Write-PinLog "Password check errored: $($_.Exception.Message)" 'ERROR'
+        $false
+    }
+    finally {
+        if ($ptr   -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr) }
+        if ($token -ne [IntPtr]::Zero) { [void][PinAuth.Logon]::CloseHandle($token) }
+    }
+}
+
+function Write-PinAudit {
+    <#
+    .SYNOPSIS
+        Records a reset decision to prompt.log and to the Application event log.
+
+    .DESCRIPTION
+        prompt.log stays on the device and is only ever read after someone has
+        already gone looking. The Application log is what a collector can pick
+        up - Azure Monitor Agent, Windows Event Forwarding, a SIEM forwarder - so
+        the event is what makes a reset queryable across every device: the
+        difference between a reset being knowable and not.
+
+        The source is created by the installer, which runs as SYSTEM. If it is
+        missing the local log still gets the line: auditing must never be the
+        thing that fails an operation that otherwise worked.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('ResetAllowed','ResetDenied','ResetThrottled','ResetCompleted','ResetFailed')]
+        [string] $Action,
+        [string] $Detail       = '',
+        # Must match the other scripts: the event source is named after it.
+        [string] $Organization = 'WK-Hub'
+    )
+
+    $ids  = @{ ResetAllowed = 3200; ResetDenied = 3201; ResetThrottled = 3202; ResetCompleted = 3203; ResetFailed = 3204 }
+    $bad  = $Action -in 'ResetDenied','ResetThrottled','ResetFailed'
+    Write-PinLog "AUDIT $Action - $Detail" $(if ($bad) { 'WARN' } else { 'INFO' })
+
+    try {
+        $src = "$Organization-BitLockerPin"
+        if ([System.Diagnostics.EventLog]::SourceExists($src)) {
+            Write-EventLog -LogName Application -Source $src -EventId $ids[$Action] `
+                           -EntryType $(if ($bad) { 'Warning' } else { 'Information' }) `
+                           -Message "BitLocker PIN $Action. $Detail" -ErrorAction Stop
+        }
+    } catch { Write-PinLog "Could not write the audit event: $($_.Exception.Message)" 'WARN' }
+}
+
+function Test-PinResetAllowed {
+    <#
+    .SYNOPSIS
+        Throttle. $false once the device has had $MaxPerDay resets in 24 hours.
+
+    .DESCRIPTION
+        A legitimate user forgets a PIN once. Repeated resets are either someone
+        probing, or a user who has not understood the dialog and is on their way to
+        locking themselves out for good - both are better served by the service
+        desk than by another attempt.
+
+        Only COMPLETED resets count (Add-PinResetRecord writes them), so a refused
+        or abandoned attempt never uses up the day's allowance.
+
+        Fails CLOSED, like the other two gates. An unreadable counter is a support
+        case, not a reason to allow unlimited resets - and whoever is asking has
+        already reached Windows, so sending them to the service desk strands
+        nobody. Only a key or value that does not exist yet reads as "no resets";
+        a read that fails for any other reason refuses, and so does a history
+        that is not what Add-PinResetRecord writes: an entry that is not a date
+        counts as a recent reset rather than being skipped.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RegKey,
+        [int] $MaxPerDay = 3
+    )
+    try {
+        # -ErrorAction Stop, not SilentlyContinue: an access-denied read has to be
+        # told apart from "nothing recorded yet", and SilentlyContinue makes both $null.
+        $p = Get-ItemProperty -LiteralPath $RegKey -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return $true      # the key does not exist yet: no resets yet
+    }
+    catch {
+        Write-PinLog "Could not read the reset history - refusing: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+
+    try {
+        $history = $p.ResetHistory
+        if ($null -eq $history) { return $true }     # no value yet: no resets yet
+        if ($history -isnot [string] -and $history -isnot [string[]]) {
+            Write-PinLog "The reset history is a $($history.GetType().Name), not a list of dates - refusing." 'WARN'
+            return $false
+        }
+
+        $cutoff = (Get-Date).AddDays(-1)
+        $recent = 0
+        foreach ($entry in @($history)) {
+            $when = $null
+            try { $when = [datetime]::ParseExact($entry, 's', [Globalization.CultureInfo]::InvariantCulture) } catch { }
+            if ($null -eq $when -or $when -gt $cutoff) { $recent++ }
+        }
+        if ($recent -ge $MaxPerDay) {
+            Write-PinLog "Reset throttled: $recent resets in the last 24 hours (limit $MaxPerDay)." 'WARN'
+            return $false
+        }
+        $true
+    }
+    catch {
+        Write-PinLog "Could not evaluate the reset history - refusing: $($_.Exception.Message)" 'WARN'
+        $false
+    }
+}
+
+function Add-PinResetRecord {
+    <#
+    .SYNOPSIS
+        Stamps a completed reset into the registry for fleet-wide reporting.
+
+    .DESCRIPTION
+        ResetCount and LastResetOn are what an Intune detection script can surface
+        across every device; ResetHistory is trimmed to 30 days so the value cannot
+        grow without bound. Bookkeeping only - never fails the caller.
+    #>
+    param([Parameter(Mandatory)][string] $RegKey)
+    try {
+        if (-not (Test-Path $RegKey)) { New-Item -Path $RegKey -Force | Out-Null }
+        $p = Get-ItemProperty -LiteralPath $RegKey -ErrorAction SilentlyContinue
+
+        $cutoff = (Get-Date).AddDays(-30)
+        $hist = @()
+        if ($p.ResetHistory) {
+            $hist = @($p.ResetHistory | Where-Object { try { [datetime]$_ -gt $cutoff } catch { $false } })
+        }
+        $hist += (Get-Date -Format 's')
+
+        New-ItemProperty -Path $RegKey -Name 'ResetHistory' -Value $hist -PropertyType MultiString -Force | Out-Null
+        New-ItemProperty -Path $RegKey -Name 'LastResetOn'  -Value (Get-Date -Format 's') -PropertyType String -Force | Out-Null
+        $count = 0; if ($p.ResetCount) { $count = [int]$p.ResetCount }
+        New-ItemProperty -Path $RegKey -Name 'ResetCount'   -Value ($count + 1) -PropertyType DWord -Force | Out-Null
+    } catch { Write-PinLog "Could not record the reset: $($_.Exception.Message)" 'WARN' }
+}
+
+$script:HelloVerifierScript = @'
+# Windows Hello verifier. Runs in the CONSOLE USER's session, never as SYSTEM.
+# Results: 0 verified, 1 declined by the user, 2 Hello unusable here,
+# 3 error, 4 shown but never answered.
+#
+# Every result is reported twice: over the named pipe the SYSTEM caller created
+# for this one process, and as the exit code. The caller trusts neither alone.
+# Anything else running as this user can end this process with whatever exit
+# code it likes, so a report only counts if it arrives over a connection made
+# by this process's own PID - and the exit code agrees with it.
+$ErrorActionPreference = 'Stop'
+
+function Send-Result([int] $Code) {
+    try {
+        $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', '__PIPE__', [System.IO.Pipes.PipeDirection]::Out)
+        $c.Connect(5000)
+        $b = [Text.Encoding]::ASCII.GetBytes("BLPIN-HELLO:$Code")
+        $c.Write($b, 0, $b.Length)
+        $c.Flush()
+        $c.Dispose()
+    } catch { }
+    exit $Code
+}
+
+try {
+    Add-Type -AssemblyName PresentationFramework, WindowsBase
+
+    # Declared without any WinRT references so it compiles on a machine that has
+    # no Windows SDK. The async operation comes back as a raw IInspectable and is
+    # driven over COM directly - that also avoids needing the
+    # System.Runtime.WindowsRuntime projection assembly, which is not loaded by
+    # default and cannot be relied on being present.
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace PinAuth
+{
+    [ComImport, Guid("39E050C3-4E74-441A-8DC0-B81104DF949C"),
+     InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+    public interface IUserConsentVerifierInterop
+    {
+        [return: MarshalAs(UnmanagedType.IInspectable)]
+        object RequestVerificationForWindowAsync(
+            IntPtr appWindow,
+            [MarshalAs(UnmanagedType.HString)] string message,
+            ref Guid riid);
+    }
+
+    // Methods sit in vtable order after the three IInspectable slots; the names
+    // are arbitrary, the order is what binds.
+    [ComImport, Guid("00000036-0000-0000-C000-000000000046"),
+     InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+    public interface IAsyncInfo
+    {
+        uint get_Id();
+        int  get_Status();      // 0 Started, 1 Completed, 2 Canceled, 3 Error
+        int  get_ErrorCode();
+        void Cancel();
+        void Close();
+    }
+
+    [ComImport, Guid("fd596ffd-2318-558f-9dbe-d21df43764a5"),
+     InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+    public interface IAsyncOperationConsent
+    {
+        void   put_Completed(IntPtr handler);
+        IntPtr get_Completed();
+        int    GetResults();    // UserConsentVerificationResult; 0 == Verified
+    }
+
+    public static class Hello
+    {
+        // PowerShell will not QueryInterface a raw __ComObject onto a ComImport
+        // interface, so every cast has to happen on this side.
+        public static object RequestForWindow(object factory, IntPtr hwnd, string message, Guid riid)
+        {
+            return ((IUserConsentVerifierInterop) factory)
+                   .RequestVerificationForWindowAsync(hwnd, message, ref riid);
+        }
+        public static int  Status(object op)    { return ((IAsyncInfo) op).get_Status(); }
+        public static int  Results(object op)   { return ((IAsyncOperationConsent) op).GetResults(); }
+        public static void Close(object op)     { ((IAsyncInfo) op).Close(); }
+    }
+}
+"@
+
+    function Invoke-DoEvents {
+        $frame = New-Object System.Windows.Threading.DispatcherFrame
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+            [System.Windows.Threading.DispatcherPriority]::Background,
+            [System.Windows.Threading.DispatcherOperationCallback] { param($f) $f.Continue = $false; return $null },
+            $frame) | Out-Null
+        [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    }
+
+    $null    = [Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]
+    $uvType  = [Windows.Security.Credentials.UI.UserConsentVerifier]
+    $iid     = $uvType.GetMethod('RequestVerificationAsync').ReturnType.GUID
+    $factory = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeMarshal]::GetActivationFactory($uvType)
+
+    # The prompt parents to a window handle. Without one the call is accepted and
+    # then never completes - which is exactly how the plain WinRT
+    # RequestVerificationAsync fails in a desktop app. The window is small and
+    # deliberately NOT topmost, so the credential dialog sits in front of it.
+    # Same near-black as the other windows, so it reads as part of the same app.
+    $w = New-Object System.Windows.Window
+    $w.WindowStyle           = 'None'
+    $w.ResizeMode            = 'NoResize'
+    $w.Width                 = 360
+    $w.Height                = 96
+    $w.WindowStartupLocation = 'CenterScreen'
+    $w.Topmost               = $false
+    $w.ShowInTaskbar         = $false
+    $w.Background            = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x16, 0x12, 0x1F))
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text                = 'Waiting for Windows Hello...'
+    $tb.Foreground          = [System.Windows.Media.Brushes]::White
+    $tb.HorizontalAlignment = 'Center'
+    $tb.VerticalAlignment   = 'Center'
+    $tb.FontSize            = 14
+    $w.Content = $tb
+    $w.Show(); $w.Activate() | Out-Null
+    Invoke-DoEvents
+
+    $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $w).Handle
+    if ($hwnd -eq [IntPtr]::Zero) { $w.Close(); Send-Result 3 }
+
+    $op = [PinAuth.Hello]::RequestForWindow($factory, $hwnd, '__MESSAGE__', $iid)
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ([PinAuth.Hello]::Status($op) -eq 0 -and $sw.Elapsed.TotalSeconds -lt __TIMEOUT__) {
+        Invoke-DoEvents
+        Start-Sleep -Milliseconds 100
+    }
+    $status = [PinAuth.Hello]::Status($op)
+    $w.Close(); Invoke-DoEvents
+
+    # Still Started means the prompt was shown and simply never answered. That is
+    # a person walking away, not a fault, so it is reported separately.
+    if ($status -eq 0) { Send-Result 4 }
+    if ($status -ne 1) { Send-Result 3 }
+
+    $r = [PinAuth.Hello]::Results($op)
+    [PinAuth.Hello]::Close($op)
+
+    # 0 Verified | 1 DeviceNotPresent | 2 NotConfiguredForUser | 3 DisabledByPolicy
+    # 4 DeviceBusy | 5 RetriesExhausted | 6 Canceled
+    switch ($r) {
+        0       { Send-Result 0 }
+        1       { Send-Result 2 }
+        2       { Send-Result 2 }
+        3       { Send-Result 2 }
+        5       { Send-Result 1 }
+        6       { Send-Result 1 }
+        default { Send-Result 3 }
+    }
+}
+catch { Send-Result 3 }
+'@
+
+function Invoke-HelloVerification {
+    <#
+    .SYNOPSIS
+        Asks the console user to prove who they are with Windows Hello.
+        Returns 'Verified', 'Declined', 'Unavailable' or 'Error'.
+
+    .DESCRIPTION
+        Hello is asked before the password because on an Entra-joined,
+        Hello-first device LogonUser rejects even the correct password - see
+        Test-WindowsPassword. Hello is the credential those users actually have.
+
+        Three things make this awkward, and all three are handled here:
+
+        1. Windows Hello cannot be invoked by SYSTEM. It belongs to a user session
+           and is brokered by CredentialUIBroker running as that user. This dialog
+           runs as SYSTEM (ServiceUI only borrows the desktop; it does not change
+           the token), so the verifier is launched into the console session with
+           the console user's own token via WTSQueryUserToken and
+           CreateProcessAsUser.
+
+        2. UserConsentVerifier.RequestVerificationAsync never completes in an
+           unpackaged desktop app - it has no window to parent the prompt to and
+           stays in the Started state forever. The verifier therefore goes through
+           IUserConsentVerifierInterop::RequestVerificationForWindowAsync with a
+           real HWND.
+
+        3. The verifier runs AS THE USER, so anything else running as that user
+           can interfere with it - end it with exit code 0, for one. An exit code
+           is therefore never taken as proof. The verifier reports over a named
+           pipe created here before it starts: one client allowed, remote clients
+           refused, and the report counts only if the connection comes from the
+           verifier's own process id and its exit code says the same thing.
+
+        What that does not stop is code already running as the signed-in user
+        that injects into the verifier itself. Nothing launched into a user's
+        session can be shielded from that user's own code. The gate is there so
+        that someone who finds the machine unlocked cannot reset the PIN with a
+        few clicks; it is not a defence against malware in the user's session.
+
+        The verifier is passed as -EncodedCommand rather than written to disk, so
+        there is no file a standard user could swap for one of their own.
+
+        Only a verified result maps to 'Verified'. Everything else is reported to
+        the caller, which decides whether to fall back or refuse.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Message,
+        [int]                          $SessionId      = -1,
+        [int]                          $TimeoutSeconds = 120
+    )
+
+    # The child gets a shorter budget than the wait, so a merely slow child
+    # reports its own timeout instead of being killed mid-prompt.
+    $childTimeout = [Math]::Max(30, $TimeoutSeconds - 15)
+
+    # Unguessable, and used for this one verification only.
+    $pipeName = 'BLPIN-' + [guid]::NewGuid().ToString('N')
+
+    $body = $script:HelloVerifierScript.
+                Replace('__MESSAGE__', ($Message -replace "'", "''")).
+                Replace('__TIMEOUT__', [string]$childTimeout).
+                Replace('__PIPE__', $pipeName)
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+
+    # Windows PowerShell by full path: WinRT type accelerators do not exist in
+    # PowerShell 7, so pwsh would fail whatever the caller happens to be running.
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path $exe)) {
+        Write-PinLog 'Windows PowerShell 5.1 not found - Hello verification cannot run.' 'ERROR'
+        return 'Unavailable'
+    }
+    $childArgs = "-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -EncodedCommand $b64"
+
+    $isSystem = $false
+    try { $isSystem = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value -eq 'S-1-5-18' } catch { }
+
+    # SYSTEM must launch into the console user's session with their token.
+    # Anyone else is already in their own session - the path a test run or a
+    # manual invocation takes - and launches as themselves. Both go through the
+    # same launcher, so both get the same authenticated result channel.
+    if ($isSystem -and $SessionId -lt 0) {
+        $SessionId = Get-ConsoleSessionId
+        if ($null -eq $SessionId) {
+            Write-PinLog 'No console session - Hello verification cannot be shown to anyone.' 'WARN'
+            return 'Unavailable'
+        }
+    }
+
+    try {
+        # Guarded: Add-Type throws if the type is already defined, and a second
+        # call in the same process would otherwise be reported as 'Unavailable'.
+        if (-not ('PinAuth.UserSession' -as [type])) {
+            Add-Type -TypeDefinition $script:UserSessionCSharp -ReferencedAssemblies 'System.Core' -ErrorAction Stop
+        }
+    }
+    catch {
+        # Same hardened-fleet exposure Test-WindowsPassword documents: Add-Type
+        # runs the C# compiler, which EDR or WDAC can block.
+        Write-PinLog "Cannot launch the Hello verifier - P/Invoke unavailable: $($_.Exception.Message)" 'ERROR'
+        return 'Unavailable'
+    }
+
+    $cmdLine = '"' + $exe + '" ' + $childArgs
+    $code = [PinAuth.UserSession]::Run($isSystem, [uint32][Math]::Max(0, $SessionId), $exe, $cmdLine,
+                                       $pipeName, $TimeoutSeconds * 1000)
+
+    if ($code -eq -1) {
+        Write-PinLog ("Hello verifier could not be started (" +
+                      [PinAuth.UserSession]::Stage + " failed, Win32 " +
+                      [PinAuth.UserSession]::LastError + ").") 'ERROR'
+        return 'Unavailable'
+    }
+
+    switch ($code) {
+        0       { Write-PinLog 'Windows Hello verification succeeded.'; 'Verified' }
+        1       { Write-PinLog 'Windows Hello verification was declined or cancelled.' 'WARN'; 'Declined' }
+        2       { Write-PinLog 'Windows Hello is not usable on this device for this user.' 'WARN'; 'Unavailable' }
+        4       { Write-PinLog 'Windows Hello prompt was shown but never answered.' 'WARN'; 'Declined' }
+        -2      { Write-PinLog 'Windows Hello verification timed out.' 'WARN'; 'Declined' }
+        -3      { Write-PinLog ("Windows Hello gave no authenticated result (" + [PinAuth.UserSession]::Stage +
+                                "; verifier exit " + [PinAuth.UserSession]::ExitCode + ") - not treated as verified.") 'WARN'; 'Error' }
+        default { Write-PinLog "Windows Hello verification errored (result $code)." 'WARN'; 'Error' }
+    }
+}
+
+# Launcher used by Invoke-HelloVerification: starts the verifier (in the console
+# user's session when called as SYSTEM) and collects its result over a named
+# pipe that only the verifier's own process can be believed on. Kept as a string
+# so the compile only happens on the path that actually needs it; a literal
+# here-string, so nothing in the C# is ever expanded by PowerShell.
+$script:UserSessionCSharp = @'
+using System;
+using System.IO.Pipes;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace PinAuth
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public uint dwProcessId, dwThreadId; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public int bInheritHandle; }
+
+    // Lets a raw process handle take part in WaitHandle.WaitAny. Does not own it.
+    sealed class ProcessWait : WaitHandle
+    {
+        public ProcessWait(IntPtr h) { SafeWaitHandle = new SafeWaitHandle(h, false); }
+    }
+
+    public static class UserSession
+    {
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        static extern bool WTSQueryUserToken(uint sessionId, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool DuplicateTokenEx(IntPtr h, uint access, IntPtr sa, int imp, int type, out IntPtr dup);
+        [DllImport("userenv.dll", SetLastError = true)]
+        static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+        [DllImport("userenv.dll", SetLastError = true)]
+        static extern bool DestroyEnvironmentBlock(IntPtr env);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CreateProcessAsUser(IntPtr token, string app, StringBuilder cmd,
+            IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir,
+            ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CreateProcess(string app, StringBuilder cmd,
+            IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir,
+            ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateNamedPipe(string name, uint openMode, uint pipeMode, uint maxInstances,
+            uint outBuffer, uint inBuffer, uint defaultTimeout, ref SECURITY_ATTRIBUTES sa);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out uint pid);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, uint revision,
+            out IntPtr sd, IntPtr size);
+        [DllImport("kernel32.dll")]
+        static extern IntPtr LocalFree(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateProcess(IntPtr h, uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+
+        public static int LastError;
+        public static string Stage = "";
+        public static int ExitCode = -1;
+
+        const string ReportPrefix = "BLPIN-HELLO:";
+
+        // -1 could not launch, -2 timed out, -3 no authenticated result,
+        // otherwise the result the verifier reported over the pipe.
+        //
+        // asUser: launch into sessionId with that session's user token (the
+        // SYSTEM path). Otherwise launch as the caller, which is what a test run
+        // or a manual invocation from the user's own session needs.
+        public static int Run(bool asUser, uint sessionId, string exe, string cmdLine, string pipeName, int timeoutMs)
+        {
+            LastError = 0; Stage = ""; ExitCode = -1;
+            IntPtr tok = IntPtr.Zero, dup = IntPtr.Zero, env = IntPtr.Zero, sd = IntPtr.Zero;
+            PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+            NamedPipeServerStream server = null;
+            int deadline = Environment.TickCount + timeoutMs;
+            try
+            {
+                // The result channel exists before the child does, with room for
+                // exactly one client. Remote clients are refused outright: over
+                // SMB the client process id is whatever the remote side claims.
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GRGW;;;AU)", 1, out sd, IntPtr.Zero))
+                { Stage = "ConvertStringSecurityDescriptor"; LastError = Marshal.GetLastWin32Error(); return -1; }
+
+                SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+                sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                sa.lpSecurityDescriptor = sd;
+
+                // PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED
+                // PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS
+                IntPtr h = CreateNamedPipe("\\\\.\\pipe\\" + pipeName, 0x00000001 | 0x00080000 | 0x40000000,
+                                           0x00000008, 1, 0, 256, 0, ref sa);
+                if (h == new IntPtr(-1))
+                { Stage = "CreateNamedPipe"; LastError = Marshal.GetLastWin32Error(); return -1; }
+                server = new NamedPipeServerStream(PipeDirection.In, true, false, new SafePipeHandle(h, true));
+                IAsyncResult connect = server.BeginWaitForConnection(null, null);
+
+                STARTUPINFO si = new STARTUPINFO();
+                si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+
+                // CreateProcessAsUser may write to the command-line buffer, so it
+                // has to be mutable - a marshalled string is not.
+                StringBuilder cmd = new StringBuilder(cmdLine, cmdLine.Length + 64);
+
+                if (asUser)
+                {
+                    if (!WTSQueryUserToken(sessionId, out tok))
+                    { Stage = "WTSQueryUserToken"; LastError = Marshal.GetLastWin32Error(); return -1; }
+
+                    // MAXIMUM_ALLOWED, SecurityImpersonation, TokenPrimary
+                    if (!DuplicateTokenEx(tok, 0x02000000, IntPtr.Zero, 2, 1, out dup))
+                    { Stage = "DuplicateTokenEx"; LastError = Marshal.GetLastWin32Error(); return -1; }
+
+                    // A missing environment block is survivable: the child only has to
+                    // draw a window, so do not fail the operation over it.
+                    if (!CreateEnvironmentBlock(out env, dup, false)) { env = IntPtr.Zero; }
+
+                    si.lpDesktop = "winsta0\\default";
+
+                    // CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+                    if (!CreateProcessAsUser(dup, exe, cmd, IntPtr.Zero, IntPtr.Zero, false,
+                                             0x00000400 | 0x08000000, env, null, ref si, out pi))
+                    { Stage = "CreateProcessAsUser"; LastError = Marshal.GetLastWin32Error(); return -1; }
+                }
+                else
+                {
+                    // CREATE_NO_WINDOW
+                    if (!CreateProcess(exe, cmd, IntPtr.Zero, IntPtr.Zero, false, 0x08000000,
+                                       IntPtr.Zero, null, ref si, out pi))
+                    { Stage = "CreateProcess"; LastError = Marshal.GetLastWin32Error(); return -1; }
+                }
+
+                using (ProcessWait exited = new ProcessWait(pi.hProcess))
+                {
+                    int which = WaitHandle.WaitAny(new WaitHandle[] { connect.AsyncWaitHandle, exited }, Remaining(deadline));
+                    if (which == WaitHandle.WaitTimeout)
+                    { Stage = "timeout"; TerminateProcess(pi.hProcess, 3); return -2; }
+                    if (which == 1)
+                    { Stage = "exited without reporting"; ExitCode = ExitCodeOf(pi.hProcess); return -3; }
+
+                    server.EndWaitForConnection(connect);
+
+                    // The one check that matters: the connection must come from the
+                    // process launched above. This process holds its handle, so the
+                    // id cannot have been recycled.
+                    uint clientPid;
+                    if (!GetNamedPipeClientProcessId(server.SafePipeHandle, out clientPid))
+                    { Stage = "GetNamedPipeClientProcessId"; LastError = Marshal.GetLastWin32Error(); TerminateProcess(pi.hProcess, 3); return -3; }
+                    if (clientPid != pi.dwProcessId)
+                    { Stage = "report came from process " + clientPid + ", not the verifier"; TerminateProcess(pi.hProcess, 3); return -3; }
+
+                    byte[] buf = new byte[64];
+                    int total = 0;
+                    while (total < buf.Length)
+                    {
+                        IAsyncResult rd = server.BeginRead(buf, total, buf.Length - total, null, null);
+                        if (!rd.AsyncWaitHandle.WaitOne(Remaining(deadline)))
+                        { Stage = "timeout"; TerminateProcess(pi.hProcess, 3); return -2; }
+                        int n = server.EndRead(rd);
+                        if (n == 0) break;
+                        total += n;
+                    }
+
+                    if (!exited.WaitOne(Remaining(deadline)))
+                    { Stage = "timeout"; TerminateProcess(pi.hProcess, 3); return -2; }
+                    ExitCode = ExitCodeOf(pi.hProcess);
+
+                    string report = Encoding.ASCII.GetString(buf, 0, total);
+                    if (report.Length != ReportPrefix.Length + 1 || !report.StartsWith(ReportPrefix, StringComparison.Ordinal))
+                    { Stage = "malformed report"; return -3; }
+                    int result = report[ReportPrefix.Length] - '0';
+                    if (result < 0 || result > 9)
+                    { Stage = "malformed report"; return -3; }
+
+                    // Two independent statements of the same outcome. If they
+                    // disagree, something other than the verifier had a hand in one.
+                    if (result != ExitCode)
+                    { Stage = "exit code " + ExitCode + " contradicts the report " + result; return -3; }
+                    return result;
+                }
+            }
+            catch (Exception e)
+            {
+                Stage = "exception: " + e.GetType().Name;
+                if (pi.hProcess != IntPtr.Zero) TerminateProcess(pi.hProcess, 3);
+                return -3;
+            }
+            finally
+            {
+                if (server != null) server.Dispose();
+                if (pi.hThread  != IntPtr.Zero) CloseHandle(pi.hThread);
+                if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+                if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+                if (dup != IntPtr.Zero) CloseHandle(dup);
+                if (tok != IntPtr.Zero) CloseHandle(tok);
+                if (sd  != IntPtr.Zero) LocalFree(sd);
+            }
+        }
+
+        static int Remaining(int deadline)
+        {
+            int left = unchecked(deadline - Environment.TickCount);
+            return left > 0 ? left : 0;
+        }
+
+        static int ExitCodeOf(IntPtr h)
+        {
+            uint code;
+            return GetExitCodeProcess(h, out code) ? (int) code : -1;
+        }
+    }
+}
+'@

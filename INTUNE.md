@@ -8,6 +8,7 @@ and your BitLocker policy from fighting each other.
 - [Remediations](#remediations)
 - [Disk encryption policy](#disk-encryption-policy)
 - [Compliance policy](#compliance-policy)
+- [Self-service reset](#self-service-reset)
 - [Autopilot and ESP](#autopilot-and-esp)
 
 ---
@@ -88,13 +89,29 @@ Leave the manual Type/Path/Code rules empty.
 
 > **Re-upload the detection script every time you replace the package.** Both
 > carry the same version string, and a mismatch causes either a permanent
-> reinstall loop (detection older than the package) or a stuck stale build
-> (detection newer).
+> reinstall loop (detection newer than the package: every install is judged
+> out of date) or a stuck stale build (detection older: devices on the old
+> version keep reporting *Installed* and are never upgraded).
+
+**Upgrading from 3.1.0.** Replace the package *and* re-upload
+`Detect-BitLockerStartupPin.ps1` — both now carry 3.3.0. Detection only fails
+when the installed version is older than its own, so if you replace the package
+but keep the 3.1.0 detection script, devices already on 3.1.0 keep reporting
+*Installed* and silently never receive 3.3.0 — no reset task, no shortcut, and
+nothing in the portal looks wrong. The reinstall re-registers and fires the enrollment task, but a
+device that already has a PIN is **not** re-prompted: the dialog sees the
+existing protector, logs that there is nothing to do and disables the task
+again. The same reinstall is what adds the [self-service reset](#self-service-reset)
+task, shortcut and event source.
 
 It detects the **installed mechanism**, not the PIN. Detecting on "a `TpmPin`
 protector exists" looks tempting, but it flaps: the installer returns 1618 on
 devices that are mid-encryption, and a protector-based rule reports *failed* on
 those until the retry lands. Real PIN coverage is the Remediations pair's job.
+
+It also deliberately does **not** check the self-service reset task, shortcut or
+event source. Those are optional extras the installer registers on a best-effort
+basis; detecting on them would turn a soft failure into a reinstall loop.
 
 ---
 
@@ -136,7 +153,7 @@ names the reason plus full context:
 ```
 NONCOMPLIANT: no startup PIN protector - user has not set a PIN | device=DEV-00051
 volume=FullyEncrypted protection=On protectors=Tpm,RecoveryPassword recovery=yes
-escrowed=yes pinSetOn=never pinChangedByUser=no app=3.1.0 task=Ready
+escrowed=yes pinSetOn=never pinChangedByUser=no app=3.3.0 task=Ready
 ```
 
 Sort the report on that column to separate **who has not set a PIN** from **who
@@ -198,7 +215,7 @@ restored on uninstall**.
 | `MinimumPIN` | your `-MinimumPin` | Default 6 |
 | `UseEnhancedPin` | `0` | Digits only — the pre-boot keyboard is always US layout, so letters and symbols get mistyped |
 | `OSEnablePrebootInputProtectorsOnSlates` | `1` | Tablets with no physical keyboard |
-| `DisallowStandardUserPINReset` | `0` | Users may change their own PIN without calling anyone |
+| `DisallowStandardUserPINReset` | `0` | Standard users may change their own PIN with Windows' *Change PIN* / `manage-bde -changepin`, which needs the **current** PIN. The [self-service reset](#self-service-reset) of a *forgotten* PIN does not depend on this value |
 
 Two things it deliberately does **not** touch:
 
@@ -262,6 +279,132 @@ have not seen yet.
 
 ---
 
+## Self-service reset
+
+A user who has forgotten their PIN can set a new one from **Start → Reset
+BitLocker PIN**, without an administrator. They still need the 48-digit recovery
+key **once**, to get past pre-boot and into Windows — the reset only exists
+inside Windows. There is nothing to configure for it in the portal: the Win32 app
+installs it. What you do need to get right are the prerequisites below.
+
+### What the installer adds
+
+The task and event-source names follow `-Organization` (defaults shown); the
+shortcut name is the same for every organization.
+
+| Item | Name / location | Notes |
+|---|---|---|
+| Scheduled task | `WK-Hub BitLocker PIN Reset` | No triggers, runs as SYSTEM. Authenticated users may *start* it; the enrollment task stays view-only |
+| Start-menu shortcut | `%ProgramData%\Microsoft\Windows\Start Menu\Programs\Reset BitLocker PIN.lnk` | Runs `schtasks.exe /run /tn "WK-Hub BitLocker PIN Reset"` |
+| Event source | `WK-Hub-BitLockerPin`, Application log | Audit events 3200–3204 |
+
+If any of the three cannot be registered, `install.log` gets a `WARN` and the
+install carries on — **it never fails the install**. That device's users simply
+fall back to the service desk, which is where they were before. Detection does
+not check any of them either (see [Detection](#detection)).
+
+Uninstall removes the task and the shortcut, and deliberately leaves the event
+source so past reset events stay readable.
+
+### What stands between a user and a new PIN
+
+Starting the task is not the privilege; passing its gates is. Each one fails
+closed.
+
+| Gate | Refuses when | Event |
+|---|---|---|
+| 1. Enrolled user | The signed-in user's Entra UPN does not match the device's MDM enrollment UPN, or either cannot be read | 3201 |
+| 2. Throttle | Three completed resets already in the last 24 hours | 3202 |
+| 3. Re-authentication | Windows Hello is declined, cancelled or never answered — or, where Hello cannot run at all, the Windows password is rejected | 3201 |
+
+A device with no PIN yet skips the gates and shows the ordinary first-PIN
+dialog. The service desk's `Set-BitLockerPin.ps1 -Force` (administrators only)
+still bypasses all three.
+
+### Prerequisites
+
+| Requirement | Why | Without it |
+|---|---|---|
+| **Windows Hello for Business** provisioned for users on Entra-joined devices | Hello is the re-authentication. The password fallback needs a cached password verifier, and a user who has only ever signed in with Hello has none: `LogonUser` returns **1326** (`ERROR_LOGON_FAILURE`) even for the correct password | Hello-only users cannot self-reset — service desk |
+| **User-driven enrollment** (Autopilot user-driven, or the user joining the device from Settings) | Gate 1 compares the signed-in user with the MDM enrollment UPN, so that UPN must name the real user | Self-deploying, DEM-enrolled and provisioning-package devices carry a service account's UPN or none, and are refused (3201) — service desk. For any other enrolment type, check a real device with the command below before relying on self-service |
+| Re-enroll a device that changes hands | A handed-over device keeps the previous owner's enrollment UPN | The new user is refused (3201) — service desk |
+
+Shared and kiosk devices are already excluded by the
+[assignment](#assignment); the one-user identity check is another reason to keep
+them out.
+
+To see which UPN a device was enrolled with:
+
+```powershell
+Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' |
+    Get-ItemProperty | Where-Object { $_.UPN -and $_.ProviderID } |
+    Select-Object UPN, ProviderID
+```
+
+### Throttle
+
+| Rule | Value |
+|---|---|
+| Limit | **3 completed** self-service resets per device in a rolling 24 hours |
+| What counts | Completed resets only — refused or abandoned attempts never use up the allowance |
+| History unreadable | Refused (fails closed) |
+| Fourth attempt | *Too many PIN resets today* notice and event 3202 |
+| Configurable | No |
+
+A service-desk `-Force` reset is neither throttled nor counted.
+
+### Collecting the audit events
+
+Every decision is written to the device's Application log, source
+`WK-Hub-BitLockerPin`, and as an `AUDIT` line in `prompt.log`.
+
+| Event | Name | Level | Meaning |
+|---|---|---|---|
+| 3200 | `ResetAllowed` | Information | All three gates passed; the PIN dialog is about to open |
+| 3201 | `ResetDenied` | Warning | Not the enrolled user, Hello declined, or password rejected |
+| 3202 | `ResetThrottled` | Warning | Reset limit reached |
+| 3203 | `ResetCompleted` | Information | New PIN protector in place |
+| 3204 | `ResetFailed` | Warning | Protector change failed — the detail says if the device was left with no PIN |
+
+They stay on the device until something collects the Application log:
+
+| Collector | Configuration |
+|---|---|
+| Azure Monitor Agent | A data collection rule with a **Windows Event Logs** data source on the Application log, filtered to the source with the custom XPath `Application!*[System[Provider[@Name='WK-Hub-BitLockerPin']]]`. Query with `Event \| where Source == "WK-Hub-BitLockerPin"` |
+| Windows Event Forwarding | A subscription on the Application log filtered to the `WK-Hub-BitLockerPin` source; point devices at the collector with **Configure target Subscription Manager** (**Administrative Templates → Windows Components → Event Forwarding**) |
+| A SIEM forwarder | Filter the Application log on the same source |
+
+Do not rely on Defender for Endpoint for these: it does not pick up custom
+Application-log events.
+
+### Reporting resets across devices
+
+A completed reset stamps `HKLM\SOFTWARE\WK-Hub\BitLockerPin` (`WK-Hub` being
+your `-Organization`):
+
+| Value | Type | Holds |
+|---|---|---|
+| `ResetCount` | DWORD | Total completed self-service resets |
+| `LastResetOn` | String | Time of the last completed reset |
+| `ResetHistory` | Multi-string | Timestamps of completed resets, trimmed to 30 days (feeds the throttle) |
+
+`PinSetOn` is updated too, as it is by every successful set.
+
+To see them in the portal without a log pipeline, add a **detection-only**
+Remediation (no remediation script, run as system, 64-bit, daily) and read its
+**Detection output** column:
+
+```powershell
+$p    = Get-ItemProperty 'HKLM:\SOFTWARE\WK-Hub\BitLockerPin' -ErrorAction SilentlyContinue
+$last = if ($p.LastResetOn) { $p.LastResetOn } else { 'never' }
+Write-Output "resets=$([int]$p.ResetCount) lastReset=$last | device=$env:COMPUTERNAME"
+exit 0
+```
+
+It always exits 0: this is reporting, not something to fix.
+
+---
+
 ## Autopilot and ESP
 
 Do not put this app in the **Enrollment Status Page** blocking list.
@@ -274,3 +417,8 @@ Assign it as a normal Required app instead. It lands after ESP, the user signs
 in, and the dialog appears at the next logon or unlock — which is the intended
 flow anyway, since there is no point asking for a PIN before there is a user to
 ask.
+
+Use a **user-driven** profile if you want the self-service reset. It trusts only
+the user named in the MDM enrollment, so self-deploying devices get the service
+desk path instead (see
+[Self-service reset](#self-service-reset)).

@@ -16,7 +16,7 @@
 #>
 # Must match the value the installer used.
 $Organization = 'WK-Hub'
-$AppVersion   = '3.1.0'
+$AppVersion   = '3.3.0'
 
 $regKey   = "HKLM:\SOFTWARE\$Organization\BitLockerPin"
 $taskName = "$Organization BitLocker PIN Enrollment"
@@ -47,6 +47,13 @@ try {
     # The task is legitimately Disabled once a PIN has been set - existence, not
     # state, is what we check.
     if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) { exit 1 }
+
+    # The self-service reset task and its Start-menu shortcut are deliberately
+    # NOT checked. The installer treats their registration as non-fatal - a
+    # device without them still enrols a PIN, the user just falls back to the
+    # service desk to reset it. Detecting on them would turn that soft failure
+    # into a hard one: detection would report not-installed, Intune would
+    # reinstall on every cycle, and the device would never settle.
 
     Write-Output 'Installed'
     exit 0

@@ -1,7 +1,7 @@
 <img src="docs/banner/banner.png" alt="BitLocker Startup PIN - pre-boot security, pushed by Intune" width="100%">
 
 <p align="center">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-92%20passing-D81B74?style=for-the-badge&labelColor=16121F">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-119%20passing-D81B74?style=for-the-badge&labelColor=16121F">
   <img alt="PowerShell" src="https://img.shields.io/badge/PowerShell-5.1-5CE1E6?style=for-the-badge&labelColor=16121F">
   <img alt="Platform" src="https://img.shields.io/badge/Windows-10%201809%2B-5CE1E6?style=for-the-badge&labelColor=16121F">
   <img alt="Licence" src="https://img.shields.io/badge/licence-MIT-D81B74?style=for-the-badge&labelColor=16121F">
@@ -79,6 +79,48 @@ absence, not just for the PIN's presence.
 
 ---
 
+## Forgot the PIN: the way back in
+
+Without self-service, a forgotten pre-boot PIN is a service-desk job twice over:
+a recovery key to get in, then an admin to set a new PIN. Now the key is needed
+once and the user does the rest.
+
+<img src="docs/screenshots/manage-window-branded.png" alt="The self-service reset window a user opens from Start" width="100%">
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'primaryColor':'#221B33','primaryTextColor':'#EDEAF5','primaryBorderColor':'#5CE1E6','lineColor':'#5CE1E6','secondaryColor':'#16121F','tertiaryColor':'#1f1a2e','fontFamily':'Consolas, monospace'}}}%%
+flowchart TB
+    K([48-digit recovery key, once]) -->|past pre-boot, into Windows| S["Start menu: Reset BitLocker PIN"]
+    S --> G1{{"GATE 1: the user who enrolled the device"}}
+    G1 --> G2{{"GATE 2: at most 3 resets in 24 hours"}}
+    G2 --> G3{{"GATE 3: Windows Hello, password if Hello is unavailable"}}
+    G3 --> P([New PIN, asked for at the next boot])
+```
+
+The recovery key is unavoidable: the reset lives inside Windows, not in pre-boot.
+**Start > Reset BitLocker PIN** then opens the window above. Any signed-in user
+can start it; nothing changes until all three gates pass. Starting the task is
+not the privilege, passing the gates is.
+
+- **Gate 1, the enrolled user.** The signed-in Entra account must be the one
+  that enrolled the device. Local accounts and anyone else are refused.
+- **Gate 2, the throttle.** At most three completed resets in a rolling 24
+  hours. If the history cannot be read, the answer is no.
+- **Gate 3, Windows Hello.** Declining or cancelling stops the reset. The
+  account password is asked for only when Hello is not set up or cannot run,
+  never as a second guess.
+
+A reset is the one flow that must remove before it adds: only one PIN protector
+may exist, and the old PIN is unknown. If the new one then fails to land, the
+device drops back to TPM-only so it still starts, and the user is told plainly
+that it now starts without a PIN. Every gate decision - allowed, denied,
+throttled, completed, failed - is an event (3200-3204) in the Application log
+under `<Org>-BitLockerPin`; simply closing the window is only noted in the
+local log. The full flow, the events and the
+limits: [docs/REFERENCE.md, section 9.1](docs/REFERENCE.md#91-self-service-reset).
+
+---
+
 ## Requirements
 
 | | |
@@ -87,7 +129,7 @@ absence, not just for the PIN's presence.
 | **Join type** | Entra-joined or hybrid, so the recovery key can escrow |
 | **Management** | Microsoft Intune |
 | **You supply** | `ServiceUI.exe` (MDT) and `IntuneWinAppUtil.exe`, neither redistributed here |
-| **Tests** | 92 passing, touching no BitLocker state |
+| **Tests** | 119 passing, touching no BitLocker state |
 
 ---
 
@@ -106,6 +148,7 @@ absence, not just for the PIN's presence.
 ```powershell
 .\Set-BitLockerPin.ps1 -PreviewUI              # the PIN dialog
 .\Set-BitLockerPin.ps1 -PreviewNotEncrypted    # the "not encrypted" notice
+.\Set-BitLockerPin.ps1 -PreviewManage          # the self-service reset window
 ```
 
 ---
@@ -132,12 +175,15 @@ Everything is namespaced under `-Organization` (default `WK-Hub`).
 | | |
 |---|---|
 | `C:\ProgramData\<Org>\BitLockerPin` | payload and logs; SYSTEM + Administrators only |
-| `HKLM\SOFTWARE\<Org>\BitLockerPin` | version and state markers |
+| `HKLM\SOFTWARE\<Org>\BitLockerPin` | version and state markers, plus `ResetHistory`, `LastResetOn` and `ResetCount` for self-service resets |
 | Scheduled task `<Org> BitLocker PIN Enrollment` | runs the dialog in the user's session |
+| Scheduled task `<Org> BitLocker PIN Reset` | the self-service reset; no triggers, signed-in users may start it |
+| Start-menu shortcut `Reset BitLocker PIN` | starts the reset task |
+| Event source `<Org>-BitLockerPin` | reset audit events in the Application log; **left on uninstall on purpose** so past resets stay readable |
 | `HKLM\SOFTWARE\Policies\Microsoft\FVE` | startup-auth values, **backed up first and restored on uninstall** |
 
-It never writes a PIN to a log, a file or a command line, and never removes a
-working protector before its replacement is verified.
+It never writes a PIN to a log, a file or a command line and, outside a PIN
+reset, never removes a working protector before its replacement is verified.
 
 ---
 
@@ -162,7 +208,15 @@ the PIN comes later from the dialog, which re-checks every precondition each run
 
 - **Pilot with 5-10 devices.** Not a ring. Not a department.
 - **Exclude shared, kiosk and Wake-on-LAN devices.** A pre-boot prompt stops
-  unattended boot dead.
+  unattended boot dead, and self-service reset only trusts the one user who
+  enrolled the device.
+- **Self-service on Entra-joined devices needs Windows Hello for Business.** The
+  password fallback checks the password Windows has cached for the account. A
+  user who has only ever signed in with Hello has none, so even the right
+  password fails with 1326; they can reset only through Hello.
+- **The Hello gate stops a passer-by, not malware.** It protects an unlocked,
+  unattended session. Code already running as the signed-in user is beyond what
+  it can defend against.
 - Uninstalling deliberately **leaves the PIN in place**. Removing a deployment
   tool must not quietly weaken a device; `-RemovePinProtector` is the explicit
   rollback.

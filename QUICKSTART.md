@@ -76,8 +76,9 @@ Loosening or deleting that check is the wrong fix.
 ## Step 3 — Set your organization name (optional, but do it)
 
 `-Organization` is the one knob everybody turns. It namespaces the registry key,
-the `%ProgramData%` folder, the scheduled task name, and the wordmark shown when
-you supply no logo. It defaults to `WK-Hub`.
+the `%ProgramData%` folder, both scheduled task names (enrolment and self-service
+reset), the Application-log event source, and the wordmark shown when you supply
+no logo. It defaults to `WK-Hub`.
 
 **It must contain no spaces** — `ServiceUI.exe` strips quotes from the command
 line it forwards, so a name with a space arrives split and the install refuses to
@@ -85,26 +86,29 @@ register the task.
 
 Intune passes `-Organization` to the installer, but the detection and remediation
 scripts are uploaded to Intune on their own and **take no arguments**, so their
-defaults have to match. Change all six together:
+defaults have to match. `BitLockerPin.Common.ps1` is on the list too — the
+`-Organization` default on its `Write-PinAudit` names the event source the
+self-service reset writes to. Change all seven together:
 
 ```powershell
 # Replace Contoso with your own single-word name.
 $org   = 'Contoso'
 $files = @('Install-BitLockerStartupPin.ps1','Detect-BitLockerStartupPin.ps1',
            'Uninstall-BitLockerStartupPin.ps1','Set-BitLockerPin.ps1',
-           'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1')
+           'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1',
+           'BitLockerPin.Common.ps1')
 foreach ($f in $files) {
     (Get-Content $f -Raw).Replace("`$Organization = 'WK-Hub'", "`$Organization = '$org'") |
         Set-Content $f -NoNewline
 }
 
-# Prove it took. This must print "92 passed, 0 failed".
+# Prove it took. This must print "119 passed, 0 failed".
 .\Test-BitLockerPinApp.ps1
 ```
 
-Two of those 92 tests exist specifically to catch a half-finished rename: one
-asserts all six files agree on the name, the other asserts the task name is
-*derived* from it rather than hardcoded.
+Two of those 119 tests exist specifically to catch a half-finished rename: one
+asserts all seven files agree on the name, the other asserts the task names —
+enrolment and reset — are *derived* from it rather than hardcoded.
 
 ---
 
@@ -189,9 +193,20 @@ Get-ItemProperty 'HKLM:\SOFTWARE\WK-Hub\BitLockerPin' | Format-List
 # 2. Is the task registered and enabled?
 Get-ScheduledTask -TaskName 'WK-Hub BitLocker PIN Enrollment' | Select-Object State
 
-# 3. Watch the dialog's own log while you sign out and back in.
+# 3. Is the self-service reset in place? The reset task has no triggers - the
+#    Start-menu shortcut starts it - so it only needs to exist. Test-Path
+#    should print True.
+Get-ScheduledTask -TaskName 'WK-Hub BitLocker PIN Reset' | Select-Object State
+Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Reset BitLocker PIN.lnk"
+
+# 4. Watch the dialog's own log while you sign out and back in.
 Get-Content 'C:\ProgramData\WK-Hub\BitLockerPin\prompt.log' -Wait -Tail 5
 ```
+
+If the reset task or the shortcut is missing, `install.log` in the same folder
+has a `WARN` line saying why. Neither fails the install and detection does not
+check them, so the app still reports *Installed* — the user just falls back to
+the service desk for a forgotten PIN.
 
 Sign out and back in. The dialog should appear within about two minutes. Set a
 PIN, then confirm the protector actually swapped:
@@ -205,6 +220,18 @@ TPM-only protector silently cancels the PIN prompt at boot — the device starts
 straight into Windows and nobody notices the PIN never applied.
 
 **Then reboot** and confirm the pre-boot prompt appears and your PIN works.
+
+**Finally, try the self-service reset.** Sign in as the device's enrolled user —
+an ordinary standard account — and open **Start → Reset BitLocker PIN**. Choose
+**Reset my PIN**, pass the Windows Hello prompt, set a new PIN, reboot, and
+confirm the new PIN works. This needs Windows Hello set up for that user: the
+password fallback only works where the account has signed in to this device with
+its password at least once. Two events should be in the Application log,
+**3200** (reset allowed) and **3203** (reset completed):
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='WK-Hub-BitLockerPin' } -MaxEvents 20
+```
 
 ---
 
@@ -231,7 +258,9 @@ Details and what each output line means: **[INTUNE.md](INTUNE.md#remediations)**
 ## Rolling back
 
 ```powershell
-# Removes the mechanism, restores the FVE policy. LEAVES the PIN in place.
+# Removes the mechanism (both tasks and the Start-menu shortcut), restores the
+# FVE policy. LEAVES the PIN in place, and the event source, so past reset
+# events stay readable.
 .\Uninstall-BitLockerStartupPin.ps1
 
 # The explicit rollback: also puts the device back on a TPM-only protector.

@@ -41,6 +41,18 @@ param(
     # protector before adding its replacement.
     [switch] $Force,
 
+    # Self-service entry point, invoked by the Start-menu shortcut through the
+    # "<Organization> BitLocker PIN Reset" task. Shows the device's current PIN
+    # status and, for the device's enrolled user, under the daily reset limit,
+    # and only after they confirm who they are with Windows Hello (or their
+    # Windows password where Hello cannot run), turns itself into the reset flow
+    # above.
+    #
+    # -Force remains the service desk's way in and skips those gates by design:
+    # the task carrying it is ACL'd to SYSTEM and Administrators, so an ordinary
+    # user cannot reach it.
+    [switch] $Manage,
+
     # Show the dialog without touching BitLocker: no pre-flight queries, and
     # "Set PIN" validates the input then stops. For screenshots, helpdesk
     # training, and checking the layout on a real desktop. Needs no privilege.
@@ -48,7 +60,12 @@ param(
 
     # Render the "this device is not encrypted" notice and exit. For checking the
     # wording and layout without having to decrypt a machine. Needs no privilege.
-    [switch] $PreviewNotEncrypted
+    [switch] $PreviewNotEncrypted,
+
+    # Render the self-service windows - the "your PIN is set" page and, if you
+    # press "Reset my PIN", the password prompt - and exit. Nothing is verified
+    # and nothing is changed. Needs no privilege.
+    [switch] $PreviewManage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +84,17 @@ function Disable-EnrollmentTask {
         Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
         Write-PinLog "Disabled scheduled task '$taskName'."
     } catch { Write-PinLog "Could not disable the task: $($_.Exception.Message)" 'WARN' }
+}
+
+function Enable-EnrollmentTask {
+    # The inverse, for the one path that can leave a device with no PIN after
+    # the task was disabled: a reset that removed the old PIN protector and then
+    # failed to add the new one. Re-arming the task brings the ordinary prompt
+    # back at the next logon or unlock, without waiting for remediation to run.
+    try {
+        Enable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+        Write-PinLog "Re-enabled scheduled task '$taskName'."
+    } catch { Write-PinLog "Could not re-enable the task: $($_.Exception.Message)" 'WARN' }
 }
 
 function Test-PinSecure {
@@ -239,7 +267,240 @@ function Show-IssueNotice {
     catch { Write-PinLog "Could not show the notice window: $($_.Exception.Message)" 'WARN' }
 }
 
-Write-PinLog "--- PIN dialog invoked$(if ($PreviewUI) { ' (PREVIEW - no BitLocker changes)' }) ---"
+function Show-ManageWindow {
+    <#
+        The self-service landing page. Tells the user the PIN is set - which is
+        most of what they came to find out - and offers the reset.
+
+        Returns $true only if they asked for a reset. Any failure returns $false,
+        because a window that could not be drawn must not be read as consent.
+
+        Same layout, palette and optional branding as the notice. The images go
+        through Get-BrandXaml for the reason the notice's do: a missing PNG
+        would throw out of XamlReader.Load, this function would return $false,
+        and a device with no artwork would never be offered the reset at all.
+    #>
+    param([string] $PinSetOn)
+
+    $result = $false
+    try {
+        $brand = Get-BrandXaml -Root $root -BrandName $Organization
+
+        [xml]$x = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$Organization - startup PIN" Height="480" Width="700"
+        WindowStartupLocation="CenterScreen" WindowStyle="SingleBorderWindow"
+        ResizeMode="CanMinimize" ShowInTaskbar="True" Topmost="True"$($brand.WindowIcon)
+        Background="#FF16121F" FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style x:Key="Primary" TargetType="Button">
+      <Setter Property="Background" Value="#FFD81B74"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Name="b" Background="{TemplateBinding Background}" CornerRadius="3">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#FFFF4D9D"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Ghost" TargetType="Button" BasedOn="{StaticResource Primary}">
+      <Setter Property="Foreground" Value="#FF1A1526"/>
+      <Setter Property="FontWeight" Value="Normal"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Name="b" Background="Transparent" BorderBrush="#FFCFC9DE" BorderThickness="1" CornerRadius="3">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#FFEDEAF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <Grid Grid.Column="0">
+      $($brand.Backdrop)
+      $($brand.NoticeMark)
+      $($brand.NoticeFooter)
+    </Grid>
+    <Border Grid.Column="1" Background="#FFF6F4FA">
+      <Grid Margin="34,30,34,24">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" FontSize="21" FontWeight="SemiBold" Foreground="#FF1A1526"
+                   TextWrapping="Wrap" Margin="0,0,0,12" Text="Your startup PIN is set"/>
+        <TextBlock Grid.Row="1" FontSize="13" Foreground="#FF4A4360" TextWrapping="Wrap" LineHeight="20"
+                   Text="This computer asks for your PIN before Windows starts. That is what keeps the disk unreadable if the device is lost or stolen.&#10;&#10;If you have forgotten it, you can set a new one here. You will be asked to confirm it is you with Windows Hello (or your Windows password), and the new PIN applies the next time you start the computer."/>
+        <Border Grid.Row="2" Name="refBox" Background="#FFF0FBFC" BorderBrush="#FFCFEEF0" BorderThickness="1"
+                CornerRadius="3" Padding="12,9" Margin="0,16,0,0" Visibility="Collapsed">
+          <TextBlock Name="r" FontFamily="Consolas" FontSize="12.5" Foreground="#FF0E7C86" TextWrapping="Wrap"/>
+        </Border>
+        <!-- Close is the default button on purpose: Enter must never start a reset. -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,18,0,0">
+          <Button Name="close" Content="Close"        Width="120" Height="36" Margin="0,0,10,0" IsDefault="True" Style="{StaticResource Ghost}"/>
+          <Button Name="reset" Content="Reset my PIN" Width="150" Height="36" Style="{StaticResource Primary}"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
+"@
+        $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+        Set-BrandedTitleBar -Window $w
+        # The device name is what the service desk asks for, so it is always
+        # shown. The date is only known when this app set the PIN - a PIN that
+        # predates the install, or one assigned with -AssignDerivedPin, has none.
+        $ref = "Device:  $env:COMPUTERNAME"
+        if ($PinSetOn) { $ref += "`nPIN set: $PinSetOn" }
+        $w.FindName('r').Text = $ref
+        $w.FindName('refBox').Visibility = 'Visible'
+        $w.FindName('reset').Add_Click({ $script:manageChoice = $true;  $w.Close() })
+        $w.FindName('close').Add_Click({ $script:manageChoice = $false; $w.Close() })
+        $script:manageChoice = $false
+        $w.ShowDialog() | Out-Null
+        $result = [bool]$script:manageChoice
+    }
+    catch { Write-PinLog "Could not show the manage window: $($_.Exception.Message)" 'WARN' }
+    $result
+}
+
+function Show-PasswordPrompt {
+    <#
+        Collects the user's Windows password for re-authentication. Only reached
+        when Windows Hello cannot run on this device.
+
+        Returns a SecureString, or $null if they cancelled or the window failed.
+        WPF's PasswordBox hands back a SecureString directly, so the password is
+        never a System.String at any point on this path - the same standard the
+        PIN itself is held to.
+
+        The UPN is set from code, not written into the markup: it comes from the
+        registry, and text spliced into XAML is text the XML parser interprets.
+    #>
+    param([string] $Upn)
+
+    $secure = $null
+    try {
+        $brand = Get-BrandXaml -Root $root -BrandName $Organization
+
+        [xml]$x = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$Organization - confirm it is you" Height="300" Width="470"
+        WindowStartupLocation="CenterScreen" WindowStyle="SingleBorderWindow"
+        ResizeMode="NoResize" ShowInTaskbar="True" Topmost="True"$($brand.WindowIcon)
+        Background="#FFF6F4FA" FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style x:Key="Primary" TargetType="Button">
+      <Setter Property="Background" Value="#FFD81B74"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Name="b" Background="{TemplateBinding Background}" CornerRadius="3">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#FFFF4D9D"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Ghost" TargetType="Button" BasedOn="{StaticResource Primary}">
+      <Setter Property="Foreground" Value="#FF1A1526"/>
+      <Setter Property="FontWeight" Value="Normal"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Name="b" Background="Transparent" BorderBrush="#FFCFC9DE" BorderThickness="1" CornerRadius="3">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="b" Property="Background" Value="#FFEDEAF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Grid Margin="28,24,28,20">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <TextBlock Grid.Row="0" FontSize="17" FontWeight="SemiBold" Foreground="#FF1A1526"
+               Text="Confirm it is you" Margin="0,0,0,8"/>
+    <TextBlock Grid.Row="1" Name="lead" FontSize="12.5" Foreground="#FF4A4360" TextWrapping="Wrap" LineHeight="18"/>
+    <PasswordBox Grid.Row="2" Name="pwd" Height="32" FontSize="14" Margin="0,16,0,0" Padding="6,4"
+                 BorderBrush="#FFD9D4E6" BorderThickness="1" Background="White"/>
+    <TextBlock Grid.Row="3" Name="msg" FontSize="12" Foreground="#FFC01A56" TextWrapping="Wrap" Margin="0,8,0,0"/>
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+      <Button Name="cancel" Content="Cancel"   Width="100" Height="32" Margin="0,0,8,0" IsCancel="True" Style="{StaticResource Ghost}"/>
+      <Button Name="ok"     Content="Continue" Width="110" Height="32" IsDefault="True" Style="{StaticResource Primary}"/>
+    </StackPanel>
+  </Grid>
+</Window>
+"@
+        $w   = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+        Set-BrandedTitleBar -Window $w
+        $w.FindName('lead').Text = "Windows Hello is not available, so enter the Windows password for $Upn to reset this computer's startup PIN."
+        $box = $w.FindName('pwd')
+        $script:pwdResult = $null
+        $w.FindName('ok').Add_Click({
+            if ($box.SecurePassword.Length -eq 0) { $w.FindName('msg').Text = 'Enter your password.'; return }
+            $script:pwdResult = $box.SecurePassword.Copy()
+            $w.Close()
+        })
+        $w.FindName('cancel').Add_Click({ $script:pwdResult = $null; $w.Close() })
+        $w.Add_ContentRendered({ $box.Focus() | Out-Null })
+        $w.ShowDialog() | Out-Null
+        $secure = $script:pwdResult
+        $script:pwdResult = $null
+    }
+    catch { Write-PinLog "Could not show the password prompt: $($_.Exception.Message)" 'WARN' }
+    $secure
+}
+
+Write-PinLog "--- PIN dialog invoked$(if ($PreviewUI -or $PreviewManage) { ' (PREVIEW - no BitLocker changes)' })$(if ($Manage) { ' (self-service)' }) ---"
+
+if ($PreviewManage) {
+    # Everything the self-service path draws, with nothing behind it: no
+    # identity check, no Hello prompt, no password verification, no protector
+    # change. For the wording, the layout and the branding.
+    if (Show-ManageWindow -PinSetOn (Get-Date -Format 's')) {
+        $previewPwd = Show-PasswordPrompt -Upn 'user@example.com'
+        if ($previewPwd) { $previewPwd.Dispose() }
+    }
+    exit 0
+}
 
 if ($PreviewNotEncrypted) {
     Show-IssueNotice -Heading 'This device is not encrypted' -Body (
@@ -395,6 +656,136 @@ if (-not $hasPin -and -not $hasPinAndKey -and -not $hasTpm) {
         $hasTpm = @(Get-TpmFamilyProtector -Volume $vol -Type 'Tpm','TpmStartupKey')
         Write-PinLog 'TPM protector restored.'
     } catch { Write-PinLog "Could not restore a TPM protector: $($_.Exception.Message)" 'ERROR' }
+}
+
+# ----------------------------------------------------------------------
+# Self-service reset. Three gates, each failing closed, between an ordinary
+# signed-in user and the protector-replacement path.
+#
+# Ordering is deliberate: identity, then throttle, then re-authentication.
+# Identity first, because asking a stranger for a credential tells them the
+# credential was the only thing in their way. Throttle before
+# re-authentication, because a Hello prompt that cannot lead anywhere only
+# teaches people to approve prompts without reading them. The throttle counts
+# completed resets only, so a refused attempt never costs the real user a slot.
+#
+# A device with no PIN yet never reaches this block: -Manage there falls
+# through to the ordinary first-PIN dialog, the same one the enrolment task
+# shows at logon.
+# ----------------------------------------------------------------------
+if ($Manage -and $hasPin -and -not $Force) {
+
+    $pinSetOn = ''
+    try { $pinSetOn = [string](Get-ItemProperty -LiteralPath $regKey -ErrorAction Stop).PinSetOn } catch { }
+
+    if (-not (Show-ManageWindow -PinSetOn $pinSetOn)) {
+        Write-PinLog 'Self-service: the user closed the window without asking for a reset.'
+        exit 0
+    }
+
+    $enrolled = Get-EnrolledUpn
+    $console  = Get-ConsoleUser
+
+    if (-not (Test-ConsoleUserIsPrimary -EnrolledUpn $enrolled -ConsoleUser $console)) {
+        Write-PinAudit -Action 'ResetDenied' -Organization $Organization `
+                       -Detail "Console user '$($console.Upn)' is not the enrolled user '$enrolled' on $env:COMPUTERNAME."
+        Show-IssueNotice -Heading 'Only the assigned user can reset this PIN' -Body (
+            "The startup PIN on this computer can only be reset by the person it is assigned to " +
+            "in our device records.`n`n" +
+            "If this is your computer, its records may be out of date - that happens when a device " +
+            "changes hands without being re-enrolled.`n`n" +
+            "Please contact the IT service desk and quote the reference below. They can reset the PIN for you."
+        ) -Reference "Device:    $env:COMPUTERNAME`nSigned in: $(if ($console -and $console.Upn) { $console.Upn } else { 'could not be determined' })`nAssigned:  $(if ($enrolled) { $enrolled } else { 'not recorded' })"
+        exit 0
+    }
+
+    if (-not (Test-PinResetAllowed -RegKey $regKey)) {
+        Write-PinAudit -Action 'ResetThrottled' -Organization $Organization `
+                       -Detail "Reset limit reached on $env:COMPUTERNAME for $($console.Upn)."
+        Show-IssueNotice -Heading 'Too many PIN resets today' -Body (
+            "This computer's startup PIN has already been reset several times in the last 24 hours, " +
+            "so self-service has been paused.`n`n" +
+            "This limit exists because repeatedly changing the PIN is a common way to end up locked " +
+            "out of the machine entirely.`n`n" +
+            "Please contact the IT service desk and quote the reference below."
+        ) -Reference "Device: $env:COMPUTERNAME`nUser:   $($console.Upn)"
+        exit 0
+    }
+
+    # Identity is established; now prove the person at the keyboard is that user
+    # and not someone who found the laptop unlocked. A live Windows session
+    # already reaches the data, so this is not protecting confidentiality - it
+    # stops a passer-by choosing a PIN they know and locking the owner out of
+    # pre-boot.
+    #
+    # Windows Hello first. On an Entra-joined, Hello-first device LogonUser
+    # rejects even the correct password, because there is no cached password
+    # verifier to check it against (see Test-WindowsPassword). Hello is the
+    # credential those users actually hold, so asking for it is both the only
+    # reliable check there and the one that matches how they already sign in.
+    $method = $null
+    $hello  = Invoke-HelloVerification -SessionId $console.SessionId -Message (
+        "Verify your identity to reset the BitLocker startup PIN on $env:COMPUTERNAME")
+
+    if ($hello -eq 'Verified') {
+        $method = 'Windows Hello'
+    }
+    elseif ($hello -eq 'Declined') {
+        # The prompt was shown and not satisfied - cancelled, or the PIN/biometric
+        # was wrong often enough for Windows to give up. Falling back to a password
+        # here would turn a failed check into a second guess at a different
+        # credential, so it stops.
+        Write-PinAudit -Action 'ResetDenied' -Organization $Organization `
+                       -Detail "Windows Hello verification declined for $($console.Upn) on $env:COMPUTERNAME."
+        Show-IssueNotice -Heading 'Identity was not verified' -Body (
+            "Windows Hello did not confirm your identity, so the startup PIN has not been " +
+            "changed.`n`n" +
+            "Start again from the Start menu and try once more. If it keeps failing, contact the " +
+            "IT service desk - they can reset the PIN for you."
+        ) -Reference "Device: $env:COMPUTERNAME`nUser:   $($console.Upn)"
+        exit 0
+    }
+    else {
+        # Hello could not produce a verified result: not enrolled, blocked by
+        # policy, the verifier could not be launched, or its result could not be
+        # authenticated. The user may still genuinely be locked out, so the
+        # password path remains as the fallback - itself a real credential check,
+        # which works where there is a cached verifier and fails closed where
+        # there is not.
+        Write-PinLog "Windows Hello unusable ($hello) - falling back to the password check." 'WARN'
+
+        $securePwd = Show-PasswordPrompt -Upn $console.Upn
+        if (-not $securePwd) {
+            Write-PinLog 'Self-service: the user cancelled the password prompt.'
+            exit 0
+        }
+
+        $verified = $false
+        try     { $verified = Test-WindowsPassword -Upn $console.Upn -Password $securePwd }
+        finally { $securePwd.Dispose() }
+
+        if (-not $verified) {
+            Write-PinAudit -Action 'ResetDenied' -Organization $Organization `
+                           -Detail "Password verification failed for $($console.Upn) on $env:COMPUTERNAME."
+            Show-IssueNotice -Heading 'That password was not accepted' -Body (
+                "The Windows password you entered could not be verified, so the startup PIN has not " +
+                "been changed.`n`n" +
+                "Start again from the Start menu and try once more. If it keeps failing, contact the " +
+                "IT service desk - they can reset the PIN for you."
+            ) -Reference "Device: $env:COMPUTERNAME`nUser:   $($console.Upn)"
+            exit 0
+        }
+        $method = 'Windows password'
+    }
+
+    Write-PinAudit -Action 'ResetAllowed' -Organization $Organization `
+                   -Detail "$($console.Upn) verified by $method on $env:COMPUTERNAME; replacing the startup PIN."
+
+    # Every gate passed. Become the reset path: the block below is skipped and the
+    # dialog opens, and the replacement logic keys off $Force exactly as it does
+    # for the service desk.
+    $Force = $true
+    $script:SelfService = $true
 }
 
 if ($hasPin -and -not $Force) {
@@ -748,18 +1139,32 @@ $btnSet.Add_Click({
                              -PropertyType String -Force -ErrorAction Stop | Out-Null
         } catch { Write-PinLog "Could not write the PinSetOn marker: $($_.Exception.Message)" 'WARN' }
 
+        # A self-service reset is the one path a user can drive on their own, so
+        # it is the one that has to leave a trail: the counter feeds the throttle
+        # and the event makes it visible off the device.
+        if ($script:SelfService) {
+            Add-PinResetRecord -RegKey $regKey
+            Write-PinAudit -Action 'ResetCompleted' -Organization $Organization `
+                           -Detail "Startup PIN replaced on $env:COMPUTERNAME by its assigned user."
+        }
+
         Disable-EnrollmentTask
         $win.Close()
     }
     catch {
-        Write-PinLog "Failed to set the PIN: $($_.Exception.Message)" 'ERROR'
+        # Captured now: the rollback below has its own try/catch, and the status
+        # line must describe the failure that got us here, not a later one.
+        $failure = $_.Exception.Message
+        Write-PinLog "Failed to set the PIN: $failure" 'ERROR'
 
         # If the reset removed the old PIN protector and the replacement did not
         # land, the volume may now have no TPM-family protector at all and would
         # boot to the recovery screen. Put a TPM-only protector back so the device
-        # still starts, then let reporting flag it as PIN-less.
+        # still starts.
+        $noPinNow = $false
         if ($removedForReset) {
             $restored = $false
+            $pinNow   = $false
             try {
                 $now = Get-BitLockerVolume -MountPoint $sysDrive
                 if (-not (Get-TpmFamilyProtector -Volume $now -Type 'Tpm','TpmStartupKey','TpmPin','TpmPinStartupKey')) {
@@ -768,8 +1173,9 @@ $btnSet.Add_Click({
                     }
                     Write-PinLog 'Rolled back to a TPM-only protector so the device still boots.' 'WARN'
                 }
-                $restored = [bool](Get-TpmFamilyProtector -Volume (Get-BitLockerVolume -MountPoint $sysDrive) `
-                                                          -Type 'Tpm','TpmStartupKey','TpmPin','TpmPinStartupKey')
+                $after    = Get-BitLockerVolume -MountPoint $sysDrive
+                $restored = [bool](Get-TpmFamilyProtector -Volume $after -Type 'Tpm','TpmStartupKey','TpmPin','TpmPinStartupKey')
+                $pinNow   = [bool](Get-TpmFamilyProtector -Volume $after -Type 'TpmPin','TpmPinStartupKey')
             }
             catch { Write-PinLog "Rollback failed: $($_.Exception.Message)" 'ERROR' }
 
@@ -780,9 +1186,34 @@ $btnSet.Add_Click({
                     "Please contact the IT service desk before rebooting, and quote 'BitLocker PIN rollback failed'.",
                     'Do not restart this device', 'OK', 'Error') | Out-Null
             }
+            elseif (-not $pinNow) {
+                # The old PIN is gone and the new one never landed, so the device
+                # now starts on the TPM alone - no PIN at all. A bare "could not
+                # set your PIN" would leave the user believing the old PIN still
+                # stands. Say what actually happened, and re-arm the enrolment
+                # task so the ordinary prompt comes back at the next unlock even
+                # if they walk away from this window.
+                Write-PinLog 'The old PIN was removed and the new one was not added - this device now starts WITHOUT a PIN.' 'ERROR'
+                Enable-EnrollmentTask
+                $noPinNow = $true
+            }
         }
 
-        Show-Status "Could not set your PIN: $($_.Exception.Message)"
+        if ($script:SelfService) {
+            Write-PinAudit -Action 'ResetFailed' -Organization $Organization `
+                           -Detail ("Reset failed on $env:COMPUTERNAME : $failure" +
+                                    $(if ($noPinNow) { ' - the device is left WITHOUT a startup PIN until one is set.' }))
+        }
+
+        if ($noPinNow) {
+            # Short on purpose - the status panel is a few lines tall. The
+            # underlying error is already in prompt.log and the audit event.
+            Show-Status ("Your old PIN was removed but the new one could not be set, so this computer " +
+                         "now starts WITHOUT a PIN. Try again now, or you will be asked at your next unlock.")
+        }
+        else {
+            Show-Status "Could not set your PIN: $failure"
+        }
         $btnSet.IsEnabled   = $true
         $btnLater.IsEnabled = $true
     }

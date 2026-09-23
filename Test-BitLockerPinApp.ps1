@@ -9,6 +9,9 @@
       * reparse-point and junction handling in the staging-path guards
       * that no script hardcodes localized account names for icacls
       * that every script parses under Windows PowerShell 5.1
+      * the self-service reset: gate order, the identity and throttle gates
+        (run for real against a throwaway HKCU key), and the Windows Hello
+        result channel (run for real against throwaway child processes)
 
     It does NOT add, remove or modify a key protector, and it does not write a
     single FVE value. The parts that need a real device - the protector swap and
@@ -854,9 +857,12 @@ Test-Case 'every script agrees on the organization name' {
     # -Organization is the one knob an adopter turns. It namespaces the registry
     # key, the %ProgramData% folder and the scheduled task, so a file left on the
     # old value silently looks at a different device state than the rest.
+    # BitLockerPin.Common.ps1 is in the list for Write-PinAudit, whose default
+    # names the event source the installer registers.
     $files = @('Install-BitLockerStartupPin.ps1','Detect-BitLockerStartupPin.ps1',
                'Uninstall-BitLockerStartupPin.ps1','Set-BitLockerPin.ps1',
-               'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1')
+               'Detect-BitLockerPinCompliance.ps1','Remediate-BitLockerPinCompliance.ps1',
+               'BitLockerPin.Common.ps1')
     $seen = @{}
     foreach ($n in $files) {
         $text = Get-Content -LiteralPath (Join-Path $PSScriptRoot $n) -Raw
@@ -883,6 +889,428 @@ Test-Case 'the task name is derived from the organization, never hardcoded' {
             throw "$n does not derive `$taskName from `$Organization"
         }
         if ($code -match "TaskName\s+'") { throw "$n still passes a literal task name" }
+        if ($code -match "'[^'\r\n]*BitLocker PIN (Enrollment|Reset)'") { throw "$n spells out a task name instead of deriving it" }
+    }
+    # The self-service task follows the same rule, in both scripts that name it.
+    foreach ($n in @('Install-BitLockerStartupPin.ps1','Uninstall-BitLockerStartupPin.ps1')) {
+        $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot $n)
+        if ($code -notmatch '\$resetTaskName\s*=\s*"\$Organization BitLocker PIN Reset"') {
+            throw "$n does not derive `$resetTaskName from `$Organization"
+        }
+    }
+}
+
+Write-Host "`n=== Self-service reset ===" -ForegroundColor Cyan
+
+Test-Case 'a re-push does NOT re-prompt a device that already has a PIN' {
+    # Detection is version-gated, so a version bump DOES reinstall, which
+    # re-registers and immediately fires the enrolment task - and the only thing
+    # between that and a second PIN prompt is this guard.
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    if ($code -notmatch '\$hasPin\s+-and\s+-not\s+\$Force') {
+        throw 'the "PIN already set, nothing to do" guard is gone - a re-push would re-prompt every user'
+    }
+    if ($code -notmatch 'Disable-EnrollmentTask') {
+        throw 'the dialog no longer disables the task after finding an existing PIN'
+    }
+}
+
+Test-Case 'self-service is scoped: -Manage acts only when a PIN exists and -Force is absent' {
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    if ($code -notmatch '\$Manage\s+-and\s+\$hasPin\s+-and\s+-not\s+\$Force') {
+        throw 'the -Manage block is not scoped to "has a PIN and not already forced"'
+    }
+}
+
+Test-Case 'the reset gates run identity -> throttle -> re-authentication, in that order' {
+    # Ordering is a security property, not style. Asking for a credential first
+    # tells a stranger it was the only obstacle; a Hello prompt shown to someone
+    # who is over the limit anyway trains people to approve prompts unread.
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    $iIdentity = $code.IndexOf('Test-ConsoleUserIsPrimary')
+    $iThrottle = $code.IndexOf('Test-PinResetAllowed')
+    $iAuth     = $code.IndexOf('Invoke-HelloVerification')
+    foreach ($p in @($iIdentity, $iThrottle, $iAuth)) { if ($p -lt 0) { throw 'a reset gate is missing entirely' } }
+    if ($iIdentity -gt $iThrottle) { throw 'the throttle runs before the identity check' }
+    if ($iThrottle -gt $iAuth)     { throw 're-authentication runs before the throttle' }
+}
+
+Test-Case 'the identity gate refuses everything but an exact enrolled-user match' {
+    $u = 'user@example.com'
+    $cases = @(
+        @{ E = $null; C = [pscustomobject]@{ SessionId = 1; Sid = 'S-1-5-21-1'; Upn = $u };  Want = $false; Why = 'no enrolment UPN' }
+        @{ E = $u;    C = $null;                                                         Want = $false; Why = 'console user unknown' }
+        @{ E = $u;    C = [pscustomobject]@{ SessionId = 1; Sid = 'S-1-5-21-1'; Upn = $null }; Want = $false; Why = 'local account (no UPN)' }
+        @{ E = $u;    C = [pscustomobject]@{ SessionId = 1; Sid = 'S-1-5-21-1'; Upn = 'other@example.com' }; Want = $false; Why = 'a different user' }
+        @{ E = $u;    C = [pscustomobject]@{ SessionId = 1; Sid = 'S-1-5-21-1'; Upn = ' USER@example.com ' }; Want = $true; Why = 'same user, other case and padding' }
+    )
+    foreach ($c in $cases) {
+        $got = Test-ConsoleUserIsPrimary -EnrolledUpn $c.E -ConsoleUser $c.C 6>$null
+        if ([bool]$got -ne $c.Want) { throw "$($c.Why): expected $($c.Want), got $got" }
+    }
+}
+
+Test-Case 'the throttle allows three resets a day and refuses the fourth' {
+    # Exercised for real against a throwaway key under HKCU - no elevation, and
+    # nothing of the product's own state is touched.
+    $key = 'HKCU:\Software\BLPinSelfTest-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+    try {
+        if (-not (Test-PinResetAllowed -RegKey $key 6>$null)) { throw 'a device with no reset history was refused' }
+
+        1..2 | ForEach-Object { Add-PinResetRecord -RegKey $key 6>$null }
+        if (-not (Test-PinResetAllowed -RegKey $key 6>$null)) { throw 'refused after only two resets' }
+
+        Add-PinResetRecord -RegKey $key 6>$null
+        if (Test-PinResetAllowed -RegKey $key 6>$null) { throw 'a fourth reset inside 24 hours was allowed' }
+
+        $p = Get-ItemProperty -LiteralPath $key
+        Assert-Equal 3 $p.ResetCount 'ResetCount must count every completed reset'
+        if (-not $p.LastResetOn) { throw 'LastResetOn was not written' }
+
+        # Resets older than a day stop counting.
+        $old = (Get-Date).AddDays(-2).ToString('s')
+        New-ItemProperty -Path $key -Name 'ResetHistory' -Value @($old, $old, $old) -PropertyType MultiString -Force | Out-Null
+        if (-not (Test-PinResetAllowed -RegKey $key 6>$null)) { throw 'resets from two days ago still count against today' }
+    }
+    finally { Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'the throttle refuses when its history cannot be read or trusted' {
+    # "Fails closed" has to mean it. An earlier version read the history with
+    # -ErrorAction SilentlyContinue, so an access-denied read looked exactly like
+    # "no resets yet" and the reset went ahead.
+    $name = 'BLPinSelfTest-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+    $key  = "HKCU:\Software\$name"
+    $me   = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $deny = New-Object Security.AccessControl.RegistryAccessRule($me, 'QueryValues', 'Deny')
+    # The ACL is edited through .NET, asking only for the permission rights: once
+    # QueryValues is denied, Get-Acl can no longer open the key to undo the change.
+    $editAcl = {
+        param([scriptblock] $Change)
+        $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\$name",
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                [Security.AccessControl.RegistryRights]'ReadPermissions, ChangePermissions')
+        try { $sec = $rk.GetAccessControl(); & $Change $sec; $rk.SetAccessControl($sec) } finally { $rk.Close() }
+    }
+    try {
+        New-Item -Path $key -Force | Out-Null
+        New-ItemProperty -Path $key -Name 'ResetHistory' -Value @((Get-Date).ToString('s')) -PropertyType MultiString -Force | Out-Null
+
+        & $editAcl { param($s) $s.AddAccessRule($deny) }
+        $allowed = Test-PinResetAllowed -RegKey $key 6>$null
+        & $editAcl { param($s) [void]$s.RemoveAccessRule($deny) }
+        if ($allowed) { throw 'an unreadable reset history was treated as "no resets"' }
+
+        # Entries that are not dates count as recent resets instead of vanishing.
+        New-ItemProperty -Path $key -Name 'ResetHistory' -Value @('x', 'y', 'z') -PropertyType MultiString -Force | Out-Null
+        if (Test-PinResetAllowed -RegKey $key 6>$null) { throw 'three unparseable entries were skipped instead of counted' }
+
+        # A value of the wrong type is not a history this app wrote.
+        New-ItemProperty -Path $key -Name 'ResetHistory' -Value 7 -PropertyType DWord -Force | Out-Null
+        if (Test-PinResetAllowed -RegKey $key 6>$null) { throw 'a DWORD reset history was accepted' }
+
+        # ...while a key that genuinely does not exist is simply "no resets yet".
+        if (-not (Test-PinResetAllowed -RegKey ($key + '-absent') 6>$null)) { throw 'a missing key was refused' }
+    }
+    finally {
+        try { & $editAcl { param($s) [void]$s.RemoveAccessRule($deny) } } catch { }
+        Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'every reset gate fails closed' {
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Test-ConsoleUserIsPrimary[\s\S]*?\n\}').Value
+    if ($fn -notmatch 'return \$false') { throw 'Test-ConsoleUserIsPrimary has no closed failure path' }
+    $fn2 = [regex]::Match($common, 'function Test-WindowsPassword[\s\S]*?\n\}').Value
+    if ($fn2 -notmatch 'return \$false') { throw 'Test-WindowsPassword does not fail closed when P/Invoke is unavailable' }
+    # The throttle too. It used to return $true from its catch, so an unreadable
+    # counter meant unlimited resets.
+    $fn3   = [regex]::Match($common, 'function Test-PinResetAllowed[\s\S]*?\n\}').Value
+    $catch = [regex]::Match($fn3, '(?s)\n    catch \{.*?\n    \}').Value
+    if (-not $catch)              { throw 'Test-PinResetAllowed has no outer catch' }
+    if ($catch -match '\$true')   { throw 'Test-PinResetAllowed fails OPEN when the reset history cannot be read' }
+    if ($catch -notmatch '\$false') { throw 'Test-PinResetAllowed does not refuse from its catch' }
+}
+
+Test-Case 'the password never becomes a managed string' {
+    # Same standard the PIN is held to: a System.String cannot be zeroed and would
+    # survive in this SYSTEM process's heap, the page file and any crash dump.
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Test-WindowsPassword[\s\S]*?\n\}').Value
+    if ($fn -match 'SecureStringToBSTR|PtrToStringAuto|PtrToStringBSTR|GetNetworkCredential|ConvertFrom-SecureString') {
+        throw 'the password is being materialised as a String'
+    }
+    if ($fn -notmatch 'SecureStringToGlobalAllocUnicode') { throw 'the password is not marshalled from a SecureString' }
+    if ($fn -notmatch 'ZeroFreeGlobalAllocUnicode')       { throw 'the marshalled password is never zero-freed' }
+}
+
+Test-Case 'no script logs or persists the password' {
+    foreach ($n in @('Set-BitLockerPin.ps1','BitLockerPin.Common.ps1')) {
+        $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot $n)
+        foreach ($m in [regex]::Matches($code, '(?im)^.*(Write-PinLog|Write-PinAudit|Write-EventLog|New-ItemProperty|Add-Content|Set-Content|Out-File).*$')) {
+            if ($m.Value -match '\$securePwd|\$previewPwd|SecurePassword|pwdResult') {
+                throw "$n appears to write the password: $($m.Value.Trim())"
+            }
+        }
+        if ($code -match 'ConvertFrom-SecureString') { throw "$n converts a SecureString back to text" }
+    }
+}
+
+Test-Case 'the password prompt does not splice the UPN into its markup' {
+    # The UPN comes from the registry. Text spliced into XAML is text the XML
+    # parser interprets, so it is set on the element from code instead.
+    $text = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1') -Raw
+    $xaml = ([regex]::Match($text, '(?s)function Show-PasswordPrompt\b.*?\[xml\]\$x\s*=\s*@"(.*?)"@')).Groups[1].Value
+    if (-not $xaml) { throw 'could not extract the password prompt XAML' }
+    if ($xaml -match '\$Upn') { throw 'the UPN is written into the XAML' }
+}
+
+Test-Case 'only the reset task is user-startable; the enrolment task stays locked' {
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Install-BitLockerStartupPin.ps1')
+    if ($code -notmatch "D:P\(A;;GA;;;SY\)\(A;;GA;;;BA\)\(A;;GR;;;AU\)") {
+        throw 'the enrolment task no longer carries its read-only-for-users ACL'
+    }
+    if ($code -notmatch "D:P\(A;;GA;;;SY\)\(A;;GA;;;BA\)\(A;;GRGX;;;AU\)") {
+        throw 'the reset task is not granted execute for authenticated users - self-service would not work'
+    }
+}
+
+Test-Case 'the reset task carries -Manage and never -Force' {
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Install-BitLockerStartupPin.ps1')
+    $resetArgs = [regex]::Match($code, '\$resetArgs\s*=\s*''([^'']+)''').Groups[1].Value
+    if (-not $resetArgs)                { throw 'the reset task arguments could not be found' }
+    if ($resetArgs -notmatch '-Manage') { throw 'the reset task does not pass -Manage' }
+    if ($resetArgs -match '-Force')     { throw 'the reset task passes -Force, which would skip every gate' }
+    if ($resetArgs -match '"')          { throw 'the reset task arguments contain double quotes, which ServiceUI strips' }
+}
+
+Test-Case 'the reset task, shortcut and event source can never fail the install' {
+    # Without them a user falls back to the service desk for a reset. Letting one
+    # of them abort the install would cost the device its PIN prompt as well.
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Install-BitLockerStartupPin.ps1')
+    foreach ($what in @('self-service reset task', 'Start-menu shortcut', 'event source')) {
+        if ($code -notmatch "catch \{ Write-PinLog `"Could not (register|create) the $what[^`"]*`" 'WARN' \}") {
+            throw "a failure to create the $what is not caught and downgraded to a warning"
+        }
+    }
+}
+
+Test-Case 'the uninstaller removes the reset task and the shortcut' {
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Uninstall-BitLockerStartupPin.ps1')
+    if ($code -notmatch 'Unregister-ScheduledTask\s+-TaskName\s+\$resetTaskName') {
+        throw 'uninstall leaves the user-startable reset task behind'
+    }
+    if ($code -notmatch 'Remove-Item\s+-LiteralPath\s+\$shortcutPath') { throw 'uninstall leaves the Start-menu shortcut behind' }
+}
+
+Test-Case 'the reset audit records a decision for every outcome' {
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    foreach ($a in @('ResetAllowed','ResetDenied','ResetThrottled','ResetCompleted','ResetFailed')) {
+        if ($common -notmatch $a) { throw "the audit has no '$a' outcome" }
+    }
+    $dialog = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    foreach ($a in @('ResetAllowed','ResetDenied','ResetThrottled','ResetCompleted','ResetFailed')) {
+        if ($dialog -notmatch $a) { throw "the dialog never emits '$a'" }
+    }
+}
+
+Test-Case 'a reset that loses the old PIN and fails to add the new one says so, and re-arms enrolment' {
+    # Rolling back to TPM-only keeps the device bootable - with NO PIN. A plain
+    # "could not set your PIN" left the user believing the old one still stood,
+    # and the disabled enrolment task would never have asked again.
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    $fn = [regex]::Match($code, 'function Enable-EnrollmentTask[\s\S]*?\n\}').Value
+    if ($fn -notmatch 'Enable-ScheduledTask\s+-TaskName\s+\$taskName') { throw 'there is no way to re-arm the enrolment task' }
+    $i = $code.IndexOf('elseif (-not $pinNow)')
+    if ($i -lt 0) { throw 'the rollback does not check whether a PIN survived' }
+    $branch = $code.Substring($i, [Math]::Min(700, $code.Length - $i))
+    if ($branch -notmatch 'Enable-EnrollmentTask') { throw 'a device left without a PIN does not re-arm the enrolment task' }
+    if ($branch -notmatch '\$noPinNow\s*=\s*\$true') { throw 'the no-PIN state is not carried to the user message' }
+    if ($code -notmatch 'if \(\$noPinNow\)[\s\S]{0,300}WITHOUT a PIN') { throw 'the user is not told the device now starts without a PIN' }
+}
+
+Test-Case 'the self-service windows parse and render with no brand images at all' {
+    # The manage window returning $false means "no reset offered". If a missing
+    # PNG could throw out of XamlReader.Load, an unbranded device would never
+    # offer the reset - so both windows must render from an empty folder.
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+    $text  = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1') -Raw
+    $empty = Join-Path $env:TEMP ('blpin-brand-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $empty | Out-Null
+    try {
+        $Organization = 'Example-Org'
+        $brand = Get-BrandXaml -Root $empty -BrandName $Organization
+        $want  = @{ 'Show-ManageWindow' = @('reset','close','r','refBox'); 'Show-PasswordPrompt' = @('lead','pwd','msg','ok','cancel') }
+        foreach ($fn in $want.Keys) {
+            $xamlText = ([regex]::Match($text, '(?s)function ' + $fn + '\b.*?\[xml\]\$x\s*=\s*@"(.*?)"@')).Groups[1].Value
+            if (-not $xamlText) { throw "could not extract the $fn XAML" }
+            if ($xamlText -match '<Image') { throw "$fn draws an image itself instead of through Get-BrandXaml" }
+            [xml]$x = $ExecutionContext.InvokeCommand.ExpandString($xamlText)
+            $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+            foreach ($n in $want[$fn]) { if (-not $w.FindName($n)) { throw "$fn has no element '$n'" } }
+            if ($fn -eq 'Show-ManageWindow') {
+                if (-not $w.FindName('close').IsDefault) { throw 'Close is not the default button - Enter could start a reset' }
+                if ($w.FindName('reset').IsDefault)      { throw 'Reset my PIN is the default button' }
+            }
+        }
+    }
+    finally { & cmd.exe /c rd /s /q "$empty" 2>$null | Out-Null }
+}
+
+Test-Case 'every window is themed through Get-BrandXaml and Set-BrandedTitleBar' {
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    foreach ($fn in @('Show-IssueNotice','Show-ManageWindow','Show-PasswordPrompt')) {
+        $body = [regex]::Match($code, "function $fn[\s\S]*?\n\}").Value
+        if (-not $body)                           { throw "$fn is missing" }
+        if ($body -notmatch 'Get-BrandXaml')      { throw "$fn does not take its artwork from Get-BrandXaml" }
+        if ($body -notmatch 'Set-BrandedTitleBar') { throw "$fn does not theme its title bar" }
+    }
+    # Artwork is Get-BrandXaml's business alone; the dialog must not name a PNG.
+    if ($code -match "\.png['`"]") { throw 'Set-BitLockerPin.ps1 references an image file directly' }
+    if ($code -match 'DwmSetWindowAttribute') { throw 'the dialog paints its title bar itself instead of calling Set-BrandedTitleBar' }
+}
+
+Write-Host "`n=== Windows Hello re-authentication ===" -ForegroundColor Cyan
+
+Test-Case 'the verifier uses the windowed interop, not the windowless WinRT call' {
+    # UserConsentVerifier.RequestVerificationAsync is accepted by an unpackaged
+    # desktop app and then never completes - it has no window to parent the prompt
+    # to and sits in Started forever. The interop call with an HWND is the only
+    # version that prompts.
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    if ($common -notmatch 'RequestVerificationForWindowAsync') {
+        throw 'the verifier no longer uses the windowed interop - the prompt will never appear'
+    }
+    if ($common -notmatch '39E050C3-4E74-441A-8DC0-B81104DF949C') {
+        throw 'the IUserConsentVerifierInterop IID is missing'
+    }
+    if ($common -notmatch 'WindowInteropHelper') {
+        throw 'no window handle is obtained, so there is nothing to parent the prompt to'
+    }
+}
+
+Test-Case 'the embedded verifier parses, and reports every outcome through the channel' {
+    $body = $script:HelloVerifierScript.Replace('__MESSAGE__', 'x').Replace('__TIMEOUT__', '60').Replace('__PIPE__', 'BLPIN-test')
+    $tokens = $null; $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($body, [ref]$tokens, [ref]$errors)
+    if ($errors) { throw "the verifier does not parse: $($errors[0].Message)" }
+    # A bare 'exit' would hand back an exit code with no report behind it, which
+    # the caller now rejects - and it would mean someone has undone the channel.
+    $bare = @($body -split "`n" | Where-Object { $_ -match '\bexit\b' -and $_ -notmatch '^\s*#' })
+    if ($bare.Count -ne 1 -or $bare[0] -notmatch 'exit \$Code') {
+        throw "the verifier exits outside Send-Result: $(($bare | ForEach-Object { $_.Trim() }) -join ' | ')"
+    }
+    foreach ($ph in @('__MESSAGE__','__TIMEOUT__','__PIPE__')) {
+        if ($script:HelloVerifierScript -notmatch $ph) { throw "placeholder $ph is gone" }
+    }
+}
+
+Test-Case 'Hello runs in the console user session, never as SYSTEM' {
+    # Hello belongs to a user session and is brokered by CredentialUIBroker running
+    # as that user. The dialog is SYSTEM - ServiceUI borrows the desktop but not
+    # the token - so the verifier has to be launched with the user's own token.
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    foreach ($api in @('WTSQueryUserToken','DuplicateTokenEx','CreateProcessAsUser')) {
+        if ($common -notmatch $api) { throw "$api is missing - the verifier cannot reach the user's session" }
+    }
+    if ($common -notmatch 'S-1-5-18') { throw 'the SYSTEM check that selects the launch path is gone' }
+}
+
+Test-Case 'the verifier is never written to disk' {
+    # A script file under ProgramData could be swapped by a standard user for one
+    # that reports success. Passing it on the command line removes the file.
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Invoke-HelloVerification[\s\S]*?\n\}').Value
+    if ($fn -notmatch 'EncodedCommand') { throw 'the verifier is no longer passed as -EncodedCommand' }
+    if ($fn -match 'Set-Content|Out-File|New-Item\s+-ItemType\s+File') {
+        throw 'the verifier is being written to disk, where a user could replace it'
+    }
+}
+
+Test-Case 'the verifier runs under Windows PowerShell, not PowerShell 7' {
+    # WinRT type accelerators do not exist in PowerShell 7; the call would fail
+    # with "Unable to find type [Windows.Security.Credentials.UI...]".
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Invoke-HelloVerification[\s\S]*?\n\}').Value
+    if ($fn -notmatch 'WindowsPowerShell.v1\.0.powershell\.exe') {
+        throw 'the verifier is not pinned to Windows PowerShell 5.1'
+    }
+    if ($fn -notmatch '-STA') { throw 'the verifier is not started in STA - WPF cannot create the window' }
+}
+
+Test-Case 'only a verified result maps to Verified, and an unauthenticated one never does' {
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Invoke-HelloVerification[\s\S]*?\n\}').Value
+    $sw = [regex]::Match($fn, 'switch \(\$code\)[\s\S]*?\n    \}').Value
+    if (-not $sw) { throw 'the result mapping could not be found' }
+    foreach ($line in ($sw -split "`n")) {
+        if ($line -match "'Verified'" -and $line -notmatch '^\s*0\s') {
+            throw "a result other than 0 maps to Verified: $($line.Trim())"
+        }
+    }
+    if ($sw -notmatch "-3\s*\{[\s\S]*?'Error'") { throw 'an unauthenticated result (-3) is not reported as Error' }
+    if ($sw -notmatch "default\s*\{[^}]*'Error'") { throw 'unknown results do not fall through to Error' }
+}
+
+Test-Case 'the launcher believes a report only from the verifier it started' {
+    # The verifier runs as the user, so its exit code alone can be forged by any
+    # process of that user (end it with code 0). Exercised for real here with
+    # throwaway child processes: an honest report is accepted, and every forgery
+    # the channel exists to stop is rejected.
+    if (-not ('PinAuth.UserSession' -as [type])) {
+        Add-Type -TypeDefinition $script:UserSessionCSharp -ReferencedAssemblies 'System.Core' -ErrorAction Stop
+    }
+    $exe  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $send = @'
+function Send-Raw([string] $Text) {
+    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', '__PIPE__', [System.IO.Pipes.PipeDirection]::Out)
+    $c.Connect(5000)
+    $b = [Text.Encoding]::ASCII.GetBytes($Text)
+    $c.Write($b, 0, $b.Length); $c.Flush(); $c.Dispose()
+}
+'@
+    $encode = { param($s) [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($s)) }
+    $run = {
+        param([string] $Child, [switch] $Impostor)
+        $pipe = 'BLPIN-' + [guid]::NewGuid().ToString('N')
+        $imp  = $null
+        if ($Impostor) {
+            $imp = Start-Process $exe -PassThru -WindowStyle Hidden -ArgumentList (
+                '-NoProfile -NonInteractive -EncodedCommand ' + (& $encode (($send + "`nSend-Raw 'BLPIN-HELLO:0'").Replace('__PIPE__', $pipe))))
+        }
+        $cmd = '"' + $exe + '" -NoProfile -NonInteractive -EncodedCommand ' + (& $encode (($send + "`n" + $Child).Replace('__PIPE__', $pipe)))
+        $r = [PinAuth.UserSession]::Run($false, 0, $exe, $cmd, $pipe, 20000)
+        if ($imp) { $null = $imp.WaitForExit(10000) }
+        $r
+    }
+
+    Assert-Equal 0  (& $run "Send-Raw 'BLPIN-HELLO:0'; exit 0")          'an honest "verified" report was not accepted'
+    Assert-Equal 1  (& $run "Send-Raw 'BLPIN-HELLO:1'; exit 1")          'an honest "declined" report was not passed through'
+    Assert-Equal -3 (& $run 'exit 0')                                    'exit code 0 with no report was accepted'
+    Assert-Equal -3 (& $run "Send-Raw 'BLPIN-HELLO:0'; exit 1")          'a report the exit code contradicts was accepted'
+    Assert-Equal -3 (& $run "Send-Raw 'VERIFIED'; exit 0")               'a malformed report was accepted'
+    Assert-Equal -3 (& $run "Start-Sleep 4; Send-Raw 'BLPIN-HELLO:0'; exit 0" -Impostor) 'a report from another process was accepted'
+}
+
+Test-Case 'a declined Hello does not fall back to the password' {
+    # Falling back would turn a failed check into a second guess at a different
+    # credential. Only "Hello could not produce a verified result" reaches it.
+    $code = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'Set-BitLockerPin.ps1')
+    # Single-quoted on purpose: inside a double-quoted string PowerShell would
+    # expand $hello and the pattern would silently match nothing.
+    $declined = [regex]::Match($code, 'elseif \(\$hello -eq ''Declined''\)[\s\S]*?\n    \}').Value
+    if (-not $declined)                        { throw 'the Declined branch is missing' }
+    if ($declined -match 'Show-PasswordPrompt') { throw 'a declined Hello falls through to the password prompt' }
+    if ($declined -notmatch 'exit 0')           { throw 'a declined Hello does not stop the reset' }
+}
+
+Test-Case 'Hello verification fails closed when the compiler is blocked' {
+    # Add-Type runs csc, which EDR or WDAC can block on a hardened fleet.
+    $common = Get-CodeOnly -Path (Join-Path $PSScriptRoot 'BitLockerPin.Common.ps1')
+    $fn = [regex]::Match($common, 'function Invoke-HelloVerification[\s\S]*?\n\}').Value
+    if ($fn -notmatch "Add-Type -TypeDefinition \`$script:UserSessionCSharp[\s\S]{0,200}?catch[\s\S]{0,400}?return 'Unavailable'") {
+        throw 'a blocked Add-Type does not fail closed'
     }
 }
 
@@ -910,6 +1338,11 @@ Still requires a pilot device (needs elevation and a reboot - not testable here)
   5. Sign in as a standard user and confirm "Change PIN now" in the notice works.
   6. Run the uninstaller with -RemovePinProtector and confirm the device still
      boots without needing the recovery key.
+  7. As the device's enrolled user (a standard user), open Start > "Reset BitLocker
+     PIN", pass Windows Hello, set a new PIN and confirm it works at the next boot.
+     The Application log shows events 3200 and 3203.
+  8. Signed in as a different user, confirm the reset is refused (event 3201); and
+     that a fourth reset inside 24 hours is refused too (event 3202).
 '@ -ForegroundColor DarkGray
 
 exit $(if ($script:Fail) { 1 } else { 0 })
